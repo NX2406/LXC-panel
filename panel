@@ -1,50 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- 核心配置 (根据需要修改这里) ---
+LISTEN_PORT=80        # 面板对外统一端口 (前端+后端)
 APP_DIR="/opt/lxd-panel"
 DATA_DIR="${APP_DIR}/data"
 LOG_DIR="/var/log/lxd-panel"
 PY_VENV="${APP_DIR}/.venv"
 
+# 默认管理员账号 (安装完直接用)
+ADMIN_USER="admin"
+ADMIN_PASS="admin123"
+
 say()  { echo -e "\033[1;36m[*]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[✗]\033[0m $*"; }
 
-need_root(){ [[ $EUID -eq 0 ]] || { err "请用 sudo/root 运行"; exit 1; }; }
+# 权限检查
+[[ $EUID -eq 0 ]] || { err "请用 sudo/root 运行"; exit 1; }
 
-ask(){ local p="$1" d="$2" v; read -r -p "${p}（默认 ${d}）: " v; echo "${v:-$d}"; }
-ask_yn(){ local p="$1" d="$2" v; read -r -p "${p} (y/n，默认 ${d}): " v; v="${v:-$d}"; v="$(echo "$v"|tr '[:upper:]' '[:lower:]')"; [[ "$v" == "y" || "$v" == "n" ]] && echo "$v" || echo "$d"; }
-norm_path(){ local p="${1:-/}"; [[ "$p" == "/" ]] && { echo "/"; return; }; echo "/$(echo "$p"|sed 's#^/*##; s#/*$##')"; }
+say "正在部署 LXD Panel (单端口·独立版)..."
 
-need_root
-
-say "Panel 一键部署（先登录 -> 再配对节点 -> 再创建容器）"
-PANEL_PORT="$(ask "1) 面板对外端口（Nginx listen）" "80")"
-BACKEND_PORT="$(ask "2) 面板后端端口（uvicorn）" "8089")"
-BASE_PATH="$(norm_path "$(ask "3) 面板访问路径（/ 或 /panel）" "/")")"
-
-CUSTOM_ADMIN="$(ask_yn "4) admin 账号密码是否自定义？" "n")"
-ADMIN_USER="admin"
-ADMIN_PASS="ChangeMeNow!"
-if [[ "$CUSTOM_ADMIN" == "y" ]]; then
-  ADMIN_USER="$(ask "   - admin 用户名" "admin")"
-  read -r -p "   - admin 密码（留空则用默认）: " t
-  [[ -n "$t" ]] && ADMIN_PASS="$t"
+# 1. 安装依赖 (移除了 Nginx，仅需 Python)
+say "配置系统环境..."
+if command -v apt-get >/dev/null; then
+    apt-get update -y >/dev/null
+    apt-get install -y python3 python3-venv python3-pip openssl curl jq >/dev/null
+elif command -v yum >/dev/null; then
+    yum install -y python3 openssl curl jq
+else
+    warn "未检测到 apt/yum，请自行确保安装了 python3, pip, openssl"
 fi
 
-say "安装依赖..."
-apt-get update -y
-apt-get install -y nginx python3 python3-venv python3-pip openssl curl jq
-
-say "创建目录..."
+# 2. 创建目录
 mkdir -p "${APP_DIR}" "${DATA_DIR}" "${LOG_DIR}"
 
-say "写入后端 app.py..."
+# 3. 写入后端 app.py
+# 核心逻辑：FastAPI 既处理 /api 请求，也托管根路径 / 的 index.html
+say "写入核心程序..."
 cat > "${APP_DIR}/app.py" <<'PY'
 import os, re, time, sqlite3, json
 from typing import Optional, List, Dict, Any
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt, JWTError
 from passlib.context import CryptContext
@@ -67,19 +66,14 @@ ALLOWED_IMAGES = [
     "images:debian/12",
 ]
 
-DEFAULT_PORT_START = 20000
-DEFAULT_PORT_END   = 40000
-
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 def init_db():
-    c = db()
-    cur = c.cursor()
+    c = db(); cur = c.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,577 +111,347 @@ def init_db():
     );
     """)
     c.commit()
-
+    # 初始管理员
     cur.execute("SELECT id FROM users WHERE role='admin' LIMIT 1")
     if not cur.fetchone():
-        cur.execute(
-            "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-            (SEED_ADMIN_USER, pwd_ctx.hash(SEED_ADMIN_PASS), "admin", int(time.time()))
-        )
+        cur.execute("INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+            (SEED_ADMIN_USER, pwd_ctx.hash(SEED_ADMIN_PASS), "admin", int(time.time())))
         c.commit()
     c.close()
 
-def make_token(user: Dict[str, Any]) -> str:
+def make_token(user):
     payload = {"sub": user["username"], "role": user["role"], "uid": user["id"], "exp": int(time.time()) + TOKEN_TTL}
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-def parse_token(token: str) -> Dict[str, Any]:
-    try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-def current_user(req: Request) -> Dict[str, Any]:
+def current_user(req: Request):
     auth = req.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing token")
-    return parse_token(auth.split(" ", 1)[1].strip())
+    if not auth.startswith("Bearer "): raise HTTPException(401, "Missing token")
+    try: return jwt.decode(auth.split(" ", 1)[1].strip(), JWT_SECRET, algorithms=[JWT_ALG])
+    except: raise HTTPException(401, "Invalid token")
 
 def require_admin(user=Depends(current_user)):
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+    if user.get("role") != "admin": raise HTTPException(403, "Admin only")
     return user
 
-def ensure_short_name(s: str):
-    if not NAME_RE.match(s):
-        raise HTTPException(status_code=400, detail="Invalid name. Use letters/numbers/dash, 2-31 chars.")
-
-def user_prefix(user: Dict[str, Any]) -> str:
-    return f"u_{user['uid']}_"
-
-def full_name(user: Dict[str, Any], short: str) -> str:
-    return user_prefix(user) + short
-
-def get_node(node_id: int) -> sqlite3.Row:
+def get_node(node_id: int):
     c = db(); cur = c.cursor()
     cur.execute("SELECT * FROM nodes WHERE id=?", (node_id,))
-    r = cur.fetchone()
-    c.close()
+    r = cur.fetchone(); c.close()
     if not r: raise HTTPException(404, "node not found")
     return r
 
-def cert_cache_dir() -> str:
+def cert_cache_dir():
     p = os.environ.get("LXD_PANEL_CERT_CACHE", "/opt/lxd-panel/cert-cache")
     os.makedirs(p, exist_ok=True)
     return p
 
-def write_node_certs(node: sqlite3.Row) -> Dict[str, str]:
+def write_node_certs(node):
     d = cert_cache_dir()
-    ca = os.path.join(d, f"node{node['id']}.ca.pem")
-    crt= os.path.join(d, f"node{node['id']}.client.crt.pem")
-    key= os.path.join(d, f"node{node['id']}.client.key.pem")
-    def w(path, content, mode):
-        old=None
-        if os.path.exists(path):
-            with open(path,"r",encoding="utf-8") as f: old=f.read()
-        if old != content:
-            with open(path,"w",encoding="utf-8") as f: f.write(content)
-            os.chmod(path, mode)
-    w(ca, node["ca_pem"], 0o644)
-    w(crt,node["client_cert_pem"],0o644)
-    w(key,node["client_key_pem"],0o600)
+    ca, crt, key = os.path.join(d,f"n{node['id']}.ca"), os.path.join(d,f"n{node['id']}.crt"), os.path.join(d,f"n{node['id']}.key")
+    def w(p, c, m):
+        if not os.path.exists(p) or open(p).read() != c:
+            with open(p,"w") as f: f.write(c)
+            os.chmod(p, m)
+    w(ca, node["ca_pem"], 0o644); w(crt, node["client_cert_pem"], 0o644); w(key, node["client_key_pem"], 0o600)
     return {"ca":ca, "crt":crt, "key":key}
 
-async def agent_call(node: sqlite3.Row, method: str, path: str, json_body: Optional[dict]=None) -> dict:
+# 后端 -> LXD 宿主机 的通信逻辑
+async def agent_call(node, method, path, json_body=None):
     url = node["base_url"].rstrip("/") + path
     files = write_node_certs(node)
-    headers = {"X-Panel-Key": node["panel_key"]}
-    timeout = httpx.Timeout(8.0, read=60.0)
+    timeout = httpx.Timeout(10.0)
+    # 这里的 verify=ca 是指后端验证 LXD 宿主机的身份
     async with httpx.AsyncClient(timeout=timeout, verify=files["ca"], cert=(files["crt"], files["key"])) as client:
-        r = await client.request(method, url, headers=headers, json=json_body)
-        try:
-            data = r.json()
-        except Exception:
-            data = {"detail": r.text}
-        if r.status_code >= 400:
-            raise HTTPException(status_code=r.status_code, detail=data.get("detail", data))
+        r = await client.request(method, url, headers={"X-Panel-Key": node["panel_key"]}, json=json_body)
+        try: data = r.json()
+        except: data = {"detail": r.text}
+        if r.status_code >= 400: raise HTTPException(r.status_code, data.get("detail", data))
         return data
 
-def alloc_port(node_id: int, user_id: int, container_name: str, proto: str, inside_port: int) -> int:
-    # 按需分配：从 node 的 [port_start, port_end] 找空闲端口
-    c = db(); cur = c.cursor()
-    cur.execute("SELECT port_start, port_end FROM nodes WHERE id=?", (node_id,))
-    row = cur.fetchone()
-    if not row:
-        c.close()
-        raise HTTPException(404, "node not found")
-    ps, pe = int(row["port_start"]), int(row["port_end"])
-    cur.execute("SELECT host_port FROM port_alloc WHERE node_id=? ORDER BY host_port ASC", (node_id,))
-    used = set([int(r[0]) for r in cur.fetchall()])
-    for p in range(ps, pe+1):
-        if p not in used:
-            cur.execute(
-                "INSERT INTO port_alloc(node_id,host_port,user_id,container_name,proto,inside_port,created_at) VALUES(?,?,?,?,?,?,?)",
-                (node_id, p, user_id, container_name, proto, inside_port, int(time.time()))
-            )
-            c.commit()
-            c.close()
-            return p
-    c.close()
-    raise HTTPException(409, "Port pool exhausted")
-
+# 数据模型
 class LoginReq(BaseModel):
     username: str
     password: str
-
 class PairNodeReq(BaseModel):
-    agent_url: str = Field(..., description="https://<agent_ip_or_domain>:443")
-    pair_token: str = Field(..., description="token printed by agent installer")
-    node_name: Optional[str] = None
-    port_start: int = DEFAULT_PORT_START
-    port_end: int = DEFAULT_PORT_END
-
+    agent_url: str
+    pair_token: str
+    port_start: int = 20000
+    port_end: int = 40000
 class CreateContainerReq(BaseModel):
     node_id: int
     name: str
     image: str
-    cpu: str = "2"             # e.g. "2" or "0,1"
+    cpu: str = "2"
     memory_mb: int = 1024
     disk_gb: int = 10
-    net_ingress_mbit: Optional[int] = None
-    net_egress_mbit: Optional[int] = None
-    expose: List[Dict[str, Any]] = []  # [{"proto":"tcp","inside_port":80}, ...]
+    expose: List[Dict[str, Any]] = []
 
 app = FastAPI(title=APP_NAME)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
-def _startup():
-    init_db()
+def _startup(): init_db()
+
+# --- 关键修改：直接托管前端页面 ---
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    with open("index.html", "r", encoding="utf-8") as f: return f.read()
 
 @app.get("/api/health")
-def health():
-    return {"ok": True, "app": APP_NAME, "ts": int(time.time())}
+def health(): return {"ok": True}
 
 @app.post("/api/login")
 def login(body: LoginReq):
     c = db(); cur = c.cursor()
     cur.execute("SELECT * FROM users WHERE username=?", (body.username,))
-    row = cur.fetchone()
-    c.close()
-    if not row or not pwd_ctx.verify(body.password, row["password_hash"]):
-        raise HTTPException(401, "Bad credentials")
-    token = make_token({"id": row["id"], "username": row["username"], "role": row["role"]})
-    return {"token": token, "role": row["role"], "username": row["username"]}
+    row = cur.fetchone(); c.close()
+    if not row or not pwd_ctx.verify(body.password, row["password_hash"]): raise HTTPException(401, "Auth failed")
+    return {"token": make_token(dict(row)), "role": row["role"], "username": row["username"]}
 
 @app.get("/api/me")
-def me(user=Depends(current_user)):
-    return {"username": user["sub"], "role": user["role"], "uid": user["uid"]}
+def me(user=Depends(current_user)): return {"username": user["sub"], "role": user["role"]}
 
 @app.get("/api/images")
-def images(user=Depends(current_user)):
-    return {"items": ALLOWED_IMAGES}
+def images(user=Depends(current_user)): return {"items": ALLOWED_IMAGES}
 
 @app.post("/api/admin/nodes/pair")
 async def pair_node(body: PairNodeReq, admin=Depends(require_admin)):
-    agent_url = body.agent_url.strip().rstrip("/")
-    if not agent_url.startswith("https://"):
-        raise HTTPException(400, "agent_url must start with https://")
-    if body.port_start < 1024 or body.port_end <= body.port_start:
-        raise HTTPException(400, "bad port range")
-
-    # 先用 pair_token 向 agent enroll（无需本地 cert）
-    timeout = httpx.Timeout(8.0, read=60.0)
-    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-        r = await client.post(agent_url + "/agent/enroll", json={"pair_token": body.pair_token.strip()})
-        try:
-            j = r.json()
-        except Exception:
-            j = {"detail": r.text}
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, j.get("detail", j))
-
-    # agent 返回：ca_pem / client_cert_pem / client_key_pem / panel_key / node_name
-    node_name = body.node_name or j.get("node_name") or agent_url
-    ca_pem = j.get("ca_pem","")
-    client_cert_pem = j.get("client_cert_pem","")
-    client_key_pem = j.get("client_key_pem","")
-    panel_key = j.get("panel_key","")
-    if not all([ca_pem, client_cert_pem, client_key_pem, panel_key]):
-        raise HTTPException(400, "agent enroll response incomplete")
-
+    url = body.agent_url.strip().rstrip("/")
+    # 第一次握手（无证书），交换 Token
+    async with httpx.AsyncClient(verify=False, timeout=10) as client:
+        r = await client.post(url + "/agent/enroll", json={"pair_token": body.pair_token})
+        if r.status_code!=200: raise HTTPException(400, "Pair failed: "+r.text)
+        j = r.json()
+    
+    # 保存证书
     c = db(); cur = c.cursor()
-    cur.execute(
-        "INSERT INTO nodes(name,base_url,panel_key,ca_pem,client_cert_pem,client_key_pem,port_start,port_end,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        (node_name, agent_url, panel_key, ca_pem, client_cert_pem, client_key_pem, int(body.port_start), int(body.port_end), int(time.time()))
-    )
-    c.commit()
-    node_id = cur.lastrowid
-    c.close()
-
-    # 用 mTLS + key 做健康检查（验证链路）
-    node = get_node(node_id)
-    await agent_call(node, "GET", "/agent/health")
-
-    return {"ok": True, "node_id": node_id, "name": node_name}
+    cur.execute("INSERT INTO nodes(name,base_url,panel_key,ca_pem,client_cert_pem,client_key_pem,port_start,port_end,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        (j.get("node_name", url), url, j["panel_key"], j["ca_pem"], j["client_cert_pem"], j["client_key_pem"], body.port_start, body.port_end, int(time.time())))
+    c.commit(); nid = cur.lastrowid; c.close()
+    return {"ok": True, "node_id": nid}
 
 @app.get("/api/nodes")
 def list_nodes(user=Depends(current_user)):
     c = db(); cur = c.cursor()
-    cur.execute("SELECT id,name,base_url,port_start,port_end,created_at FROM nodes ORDER BY id DESC")
-    rows = [dict(r) for r in cur.fetchall()]
-    c.close()
+    cur.execute("SELECT id,name,base_url FROM nodes"); rows = [dict(r) for r in cur.fetchall()]; c.close()
     return {"items": rows}
 
 @app.get("/api/containers")
 async def list_containers(node_id: int, user=Depends(current_user)):
     node = get_node(node_id)
+    # 通信：通过后端端口 -> LXD Agent
     data = await agent_call(node, "GET", "/agent/containers")
     items = data.get("items", [])
-    if user.get("role") == "admin":
-        return {"items": items}
-    pref = user_prefix(user)
-    return {"items": [x for x in items if (x.get("name","").startswith(pref))]}
+    if user["role"]!="admin": items = [x for x in items if x["name"].startswith(f"u_{user['uid']}_")]
+    return {"items": items}
 
 @app.post("/api/containers")
 async def create_container(body: CreateContainerReq, user=Depends(current_user)):
-    ensure_short_name(body.name)
-    if body.image not in ALLOWED_IMAGES and user.get("role") != "admin":
-        raise HTTPException(400, f"image not allowed. allowed={ALLOWED_IMAGES}")
-
+    if not NAME_RE.match(body.name): raise HTTPException(400, "Invalid name")
     node = get_node(body.node_id)
-    cname = full_name(user, body.name)
-
-    # 端口按需分配
+    cname = (f"u_{user['uid']}_" + body.name) if user["role"]!="admin" else body.name
+    
+    # 端口分配逻辑简化版
+    c = db(); cur = c.cursor()
+    cur.execute("SELECT port_start, port_end FROM nodes WHERE id=?", (body.node_id,))
+    ps, pe = cur.fetchone()
+    cur.execute("SELECT host_port FROM port_alloc WHERE node_id=?", (body.node_id,))
+    used = {r[0] for r in cur.fetchall()}
+    
     mappings = []
     for x in body.expose:
-        proto = str(x.get("proto","tcp")).lower()
-        inside = int(x.get("inside_port", 0))
-        if proto not in ("tcp","udp") or inside <= 0 or inside > 65535:
-            raise HTTPException(400, "bad expose item")
-        host_port = alloc_port(body.node_id, int(user["uid"]), cname, proto, inside)
-        mappings.append({"proto": proto, "host_port": host_port, "inside_port": inside})
+        found_port = -1
+        for p in range(ps, pe):
+            if p not in used: found_port = p; used.add(p); break
+        if found_port == -1: raise HTTPException(409, "No ports available")
+        mappings.append({"proto": x.get("proto","tcp"), "host_port": found_port, "inside_port": x["inside_port"]})
+        cur.execute("INSERT INTO port_alloc(node_id,host_port,user_id,container_name,proto,inside_port,created_at) VALUES(?,?,?,?,?,?,?)",
+            (body.node_id, found_port, user["uid"], cname, x.get("proto","tcp"), x["inside_port"], int(time.time())))
+    c.commit(); c.close()
 
-    payload = {
-        "name": cname,
-        "image": body.image,
-        "cpu": body.cpu,
-        "memory_mb": body.memory_mb,
-        "disk_gb": body.disk_gb,
-        "net_ingress_mbit": body.net_ingress_mbit,
-        "net_egress_mbit": body.net_egress_mbit,
-        "ports": mappings
-    }
-    data = await agent_call(node, "POST", "/agent/containers", json_body=payload)
-    return {"ok": True, "name": data.get("name", cname), "assigned_ports": data.get("assigned_ports", mappings)}
+    payload = {"name": cname, "image": body.image, "cpu": body.cpu, "memory_mb": body.memory_mb, "disk_gb": body.disk_gb, "ports": mappings}
+    await agent_call(node, "POST", "/agent/containers", json_body=payload)
+    return {"ok": True}
 PY
 
-say "写入前端 index.html..."
+# 4. 写入前端 index.html (适配单端口模式)
+say "写入前端页面..."
 cat > "${APP_DIR}/index.html" <<'HTML'
 <!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>LXD Panel</title>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>LXD Panel Lite</title>
 <style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto;margin:0;background:#0b0f17;color:#e6edf3}
-  .wrap{max-width:1100px;margin:0 auto;padding:22px}
-  .card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:16px;margin:14px 0}
-  input,select,button,textarea{background:#0b1220;border:1px solid #233047;color:#e6edf3;padding:10px 12px;border-radius:10px}
-  textarea{min-height:100px;width:100%}
-  button{cursor:pointer}
-  button.primary{background:#1d4ed8;border-color:#1d4ed8}
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-  .grow{flex:1}
-  .muted{color:#9ca3af}
-  table{width:100%;border-collapse:collapse;font-size:14px}
-  th,td{border-bottom:1px solid #22304a;padding:10px 8px;text-align:left}
-  pre{white-space:pre-wrap;background:#0b1220;border:1px solid #233047;padding:12px;border-radius:10px}
+body{background:#0d1117;color:#c9d1d9;font-family:sans-serif;margin:0;padding:20px;display:flex;justify-content:center}
+.box{width:100%;max-width:800px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:20px;margin-bottom:20px}
+input,select,button{background:#0d1117;border:1px solid #30363d;color:#fff;padding:8px;border-radius:6px;margin:5px 0;width:100%;box-sizing:border-box}
+button{background:#238636;border-color:#238636;cursor:pointer;font-weight:bold}
+button:hover{background:#2ea043}
+.row{display:flex;gap:10px} .grow{flex:1}
+h3{margin-top:0} .muted{color:#8b949e;font-size:12px}
+table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:8px;border-bottom:1px solid #30363d}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="row" style="justify-content:space-between">
-    <div>
-      <div style="font-weight:800">🛡️ LXD Panel <span class="muted" style="font-size:12px">先登录→再配对→再创建</span></div>
-      <div class="muted" id="who">未登录</div>
-      <div class="muted" id="apiStatus" style="font-size:12px"></div>
+<div class="box">
+  <div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3>🛡️ LXD Panel Lite</h3>
+        <button onclick="logout()" style="width:auto;background:#da3633;border:none">退出</button>
     </div>
-    <button onclick="logout()">退出</button>
+    <div id="status" class="muted">检查 API 中...</div>
   </div>
 
-  <div class="card" id="loginCard">
+  <div id="loginView" class="card">
     <h3>登录</h3>
-    <div class="row">
-      <input id="u" value="admin" placeholder="用户名"/>
-      <input id="p" value="ChangeMeNow!" type="password" placeholder="密码"/>
-      <button class="primary" onclick="login()">登录</button>
-    </div>
-    <div class="muted" id="loginMsg"></div>
+    <input id="u" value="admin" placeholder="用户名">
+    <input id="p" type="password" placeholder="密码">
+    <button onclick="doLogin()">登录</button>
   </div>
 
-  <div class="card" id="pairCard" style="display:none">
-    <h3>节点配对（admin）</h3>
-    <div class="muted">在被控机安装 Agent 后，会输出 pair_token。这里输入 agent_url + pair_token 完成绑定。</div>
-    <div class="row">
-      <input id="agentUrl" class="grow" placeholder="https://<agent_ip_or_domain>:443"/>
-      <input id="pairToken" class="grow" placeholder="pair_token"/>
-      <input id="pstart" value="20000" style="width:120px" placeholder="port_start"/>
-      <input id="pend" value="40000" style="width:120px" placeholder="port_end"/>
-      <button class="primary" onclick="pair()">配对</button>
+  <div id="mainView" style="display:none">
+    <div class="card" id="adminArea">
+        <h3>🔗 配对节点 (Admin)</h3>
+        <div class="row">
+            <input id="aUrl" class="grow" placeholder="https://ip:443">
+            <input id="aTok" class="grow" placeholder="pair_token">
+        </div>
+        <button onclick="pairNode()">配对</button>
     </div>
-    <div class="muted" id="pairMsg"></div>
-  </div>
 
-  <div class="card" id="nodeCard" style="display:none">
-    <div class="row" style="justify-content:space-between">
-      <h3 style="margin:0">节点</h3>
-      <button onclick="loadNodes()">刷新</button>
+    <div class="card">
+        <h3>📦 容器管理</h3>
+        <div class="row">
+            <select id="nodeSel" class="grow" onchange="loadContainers()"></select>
+            <button style="width:auto" onclick="loadNodes()">刷新节点</button>
+        </div>
+        <hr style="border:0;border-top:1px solid #30363d;margin:15px 0"/>
+        <div class="row">
+            <input id="cname" class="grow" placeholder="容器名">
+            <select id="imgSel" class="grow"></select>
+        </div>
+        <input id="ports" placeholder="端口映射 (如: tcp 80, tcp 443 多个用逗号隔开)">
+        <button onclick="createContainer()">创建容器</button>
     </div>
-    <div class="row">
-      <select id="nodeSel" onchange="loadContainers()"></select>
-      <span class="muted">端口池按需分配，创建容器时自动下发 LXD proxy 映射。</span>
-    </div>
-  </div>
 
-  <div class="card" id="createCard" style="display:none">
-    <h3>创建容器</h3>
-    <div class="row">
-      <input id="cname" placeholder="短名：web-01"/>
-      <select id="image"></select>
-      <input id="cpu" value="2" style="width:160px" placeholder='CPU: "2" 或 "0,1"'/>
-      <input id="mem" type="number" value="1024" style="width:140px" placeholder="内存MB"/>
-      <input id="disk" type="number" value="10" style="width:140px" placeholder="磁盘GB"/>
-      <input id="ing" type="number" placeholder="Ingress Mbit(可空)" style="width:170px"/>
-      <input id="eg"  type="number" placeholder="Egress Mbit(可空)" style="width:170px"/>
+    <div class="card">
+        <h3>列表</h3>
+        <table id="ctable"><thead><tr><th>名称</th><th>状态</th><th>IPv4</th></tr></thead><tbody></tbody></table>
     </div>
-    <div style="margin-top:10px" class="muted">端口映射（按需分配宿主机端口）：每行一个，如：tcp 80</div>
-    <textarea id="ports" placeholder="例：&#10;tcp 80&#10;tcp 22"></textarea>
-    <div class="row">
-      <button class="primary" onclick="create()">创建</button>
-      <span class="muted" id="createMsg"></span>
-    </div>
-    <pre id="createOut" class="muted"></pre>
-  </div>
-
-  <div class="card" id="listCard" style="display:none">
-    <div class="row" style="justify-content:space-between">
-      <h3 style="margin:0">容器列表</h3>
-      <button onclick="loadContainers()">刷新</button>
-    </div>
-    <table>
-      <thead><tr><th>名称</th><th>状态</th><th>IPv4</th></tr></thead>
-      <tbody id="tbody"></tbody>
-    </table>
   </div>
 </div>
-
 <script>
-const BASE="__BASE_PATH__";
-const API=(BASE==="/"?"":BASE)+"/api";
-let token=localStorage.getItem("token")||"";
-let me=null;
+// 自动适配当前端口，前端和后端在同一端口通信
+const API = "/api"; 
+let token = localStorage.getItem("token");
 
-function h(){ return token?{"Authorization":"Bearer "+token}:{}; }
-function msg(id,t){ document.getElementById(id).innerText=t||""; }
-
-async function fetchT(url,opt={},ms=12000){
-  const c=new AbortController(); const id=setTimeout(()=>c.abort(),ms);
-  try{ const r=await fetch(url,{...opt,signal:c.signal}); clearTimeout(id); return r; }
-  catch(e){ clearTimeout(id); throw e; }
+async function req(path, method="GET", body=null) {
+    const headers = token ? {"Authorization":"Bearer "+token} : {};
+    if(body) { headers["Content-Type"]="application/json"; body=JSON.stringify(body); }
+    const r = await fetch(API+path, {method, headers, body});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) { alert(d.detail || "Error"); throw "err"; }
+    return d;
 }
 
-async function probe(){
-  try{
-    const r=await fetchT(API+"/health",{},4000);
-    msg("apiStatus", r.ok ? "API：在线 ✅" : "API：异常 ❌");
-  }catch(e){ msg("apiStatus","API：不可用 ❌（检查Nginx/后端/路径前缀）"); }
+async function init() {
+    try {
+        await req("/health");
+        document.getElementById("status").innerText = "API 在线 ✅";
+        if(token) {
+            const u = await req("/me");
+            document.getElementById("status").innerText = `已登录: ${u.username} (${u.role})`;
+            if(u.role !== "admin") document.getElementById("adminArea").style.display = "none";
+            document.getElementById("loginView").style.display = "none";
+            document.getElementById("mainView").style.display = "block";
+            
+            const imgs = await req("/images");
+            imgSel.innerHTML = imgs.items.map(i=>`<option>${i}</option>`).join("");
+            loadNodes();
+        }
+    } catch(e) { console.log(e); }
 }
 
-async function login(){
-  msg("loginMsg","登录中...");
-  try{
-    const r=await fetchT(API+"/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u.value.trim(),password:p.value})},12000);
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok){ msg("loginMsg", j.detail||("登录失败 HTTP "+r.status)); return; }
-    token=j.token; localStorage.setItem("token",token);
-    await boot();
-  }catch(e){ msg("loginMsg","登录超时/网络错误"); }
+async function doLogin() {
+    const d = await req("/login", "POST", {username:u.value, password:p.value});
+    token = d.token; localStorage.setItem("token", token);
+    location.reload();
 }
 
-function logout(){ token=""; localStorage.removeItem("token"); location.reload(); }
+function logout() { localStorage.clear(); location.reload(); }
 
-async function boot(){
-  const r=await fetchT(API+"/me",{headers:h()},8000);
-  if(!r.ok){ logout(); return; }
-  me=await r.json();
-  who.innerText=`已登录：${me.username}（${me.role}）`;
-  loginCard.style.display="none";
-  nodeCard.style.display="";
-  createCard.style.display="";
-  listCard.style.display="";
-  pairCard.style.display=(me.role==="admin")?"":"none";
-
-  const ir=await fetchT(API+"/images",{headers:h()},8000);
-  const ij=await ir.json();
-  image.innerHTML="";
-  (ij.items||[]).forEach(x=>{const o=document.createElement("option");o.value=x;o.textContent=x;image.appendChild(o);});
-  await loadNodes();
+async function pairNode() {
+    await req("/admin/nodes/pair", "POST", {agent_url:aUrl.value, pair_token:aTok.value});
+    alert("配对成功"); loadNodes();
 }
 
-async function pair(){
-  msg("pairMsg","配对中...");
-  try{
-    const body={agent_url:agentUrl.value.trim(),pair_token:pairToken.value.trim(),port_start:parseInt(pstart.value||"20000",10),port_end:parseInt(pend.value||"40000",10)};
-    const r=await fetchT(API+"/admin/nodes/pair",{method:"POST",headers:{"Content-Type":"application/json",...h()},body:JSON.stringify(body)},20000);
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok){ msg("pairMsg", j.detail||("配对失败 HTTP "+r.status)); return; }
-    msg("pairMsg","配对成功 ✅ node_id="+j.node_id);
-    await loadNodes();
-  }catch(e){ msg("pairMsg","配对超时/网络错误（检查agent_url是否可达、443是否放行）"); }
+async function loadNodes() {
+    const d = await req("/nodes");
+    nodeSel.innerHTML = d.items.map(n=>`<option value="${n.id}">${n.name}</option>`).join("");
+    if(d.items.length) loadContainers();
 }
 
-async function loadNodes(){
-  const r=await fetchT(API+"/nodes",{headers:h()},8000);
-  const j=await r.json();
-  nodeSel.innerHTML="";
-  (j.items||[]).forEach(n=>{const o=document.createElement("option");o.value=n.id;o.textContent=`#${n.id} ${n.name} (${n.base_url})`;nodeSel.appendChild(o);});
-  if((j.items||[]).length>0) await loadContainers();
+async function loadContainers() {
+    const nid = nodeSel.value; if(!nid) return;
+    const d = await req("/containers?node_id="+nid);
+    ctable.querySelector("tbody").innerHTML = d.items.map(c=>`<tr><td>${c.name}</td><td>${c.status}</td><td>${c.ipv4||"-"}</td></tr>`).join("");
 }
 
-async function create(){
-  const nid=parseInt(nodeSel.value||"0",10);
-  if(!nid){ msg("createMsg","请先配对并选择节点"); return; }
-  msg("createMsg","创建中...");
-  const lines=(ports.value||"").split("\n").map(s=>s.trim()).filter(Boolean);
-  const expose=[];
-  for(const ln of lines){
-    const a=ln.split(/\s+/);
-    if(a.length!==2) continue;
-    expose.push({proto:a[0].toLowerCase(),inside_port:parseInt(a[1],10)});
-  }
-  const body={
-    node_id:nid,name:cname.value.trim(),image:image.value,
-    cpu:cpu.value.trim()||"2",memory_mb:parseInt(mem.value||"1024",10),disk_gb:parseInt(disk.value||"10",10),
-    net_ingress_mbit: ing.value.trim()?parseInt(ing.value.trim(),10):null,
-    net_egress_mbit:  eg.value.trim()?parseInt(eg.value.trim(),10):null,
-    expose
-  };
-  try{
-    const r=await fetchT(API+"/containers",{method:"POST",headers:{"Content-Type":"application/json",...h()},body:JSON.stringify(body)},30000);
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok){ msg("createMsg", j.detail||("失败 HTTP "+r.status)); return; }
-    msg("createMsg","创建成功 ✅");
-    createOut.innerText=JSON.stringify(j,null,2);
-    await loadContainers();
-  }catch(e){ msg("createMsg","创建超时/网络错误（首次拉镜像可能慢）"); }
+async function createContainer() {
+    const expose = ports.value.split(",").filter(x=>x.trim()).map(x=>{
+        const [p,port] = x.trim().split(/\s+/);
+        return {proto: p.toLowerCase(), inside_port: parseInt(port)};
+    });
+    await req("/containers", "POST", {
+        node_id: parseInt(nodeSel.value), name: cname.value, image: imgSel.value, expose
+    });
+    alert("创建成功，等待启动...");
+    setTimeout(loadContainers, 3000);
 }
 
-async function loadContainers(){
-  const nid=parseInt(nodeSel.value||"0",10);
-  if(!nid) return;
-  const r=await fetchT(API+`/containers?node_id=${nid}`,{headers:h()},15000);
-  const j=await r.json();
-  tbody.innerHTML="";
-  (j.items||[]).forEach(it=>{
-    const tr=document.createElement("tr");
-    tr.innerHTML=`<td>${it.name||"-"}</td><td>${it.status||"-"}</td><td>${it.ipv4||"-"}</td>`;
-    tbody.appendChild(tr);
-  });
-}
-
-probe();
-if(token) boot();
+init();
 </script>
 </body>
 </html>
 HTML
 
-say "注入 BASE_PATH..."
-sed -i "s|__BASE_PATH__|${BASE_PATH}|g" "${APP_DIR}/index.html"
-
-say "创建 venv 并安装依赖..."
+# 5. 安装并配置服务
+say "安装 Python 库 (fastapi uvicorn httpx python-jose passlib)..."
 python3 -m venv "${PY_VENV}"
-"${PY_VENV}/bin/pip" install --upgrade pip >/dev/null
-"${PY_VENV}/bin/pip" install fastapi==0.115.0 uvicorn[standard]==0.30.6 python-jose==3.3.0 passlib[bcrypt]==1.7.4 pydantic==2.8.2 httpx==0.27.2 >/dev/null
+"${PY_VENV}/bin/pip" install -U pip >/dev/null
+"${PY_VENV}/bin/pip" install fastapi==0.115.0 uvicorn==0.30.6 python-jose==3.3.0 passlib[bcrypt]==1.7.4 pydantic==2.8.2 httpx==0.27.2 >/dev/null
 
-say "写入 systemd..."
 JWT_SECRET="$(openssl rand -hex 32)"
+say "配置 Systemd 服务 (监听 0.0.0.0:${LISTEN_PORT})..."
 cat > /etc/systemd/system/lxd-panel.service <<EOF
 [Unit]
-Description=LXD Panel Backend
+Description=LXD Panel Standalone
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=${APP_DIR}
-Environment="LXD_PANEL_DB=${DATA_DIR}/panel.db"
-Environment="LXD_PANEL_CERT_CACHE=${APP_DIR}/cert-cache"
 Environment="LXD_PANEL_JWT_SECRET=${JWT_SECRET}"
 Environment="LXD_PANEL_ADMIN_USER=${ADMIN_USER}"
 Environment="LXD_PANEL_ADMIN_PASS=${ADMIN_PASS}"
-ExecStart=${PY_VENV}/bin/uvicorn app:app --host 127.0.0.1 --port ${BACKEND_PORT}
+# 关键：host 0.0.0.0 表示允许外网访问
+ExecStart=${PY_VENV}/bin/uvicorn app:app --host 0.0.0.0 --port ${LISTEN_PORT}
 Restart=always
 RestartSec=2
 StandardOutput=append:${LOG_DIR}/panel.log
-StandardError=append:${LOG_DIR}/panel.err
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
 systemctl daemon-reload
 systemctl enable --now lxd-panel.service
 
-say "配置 Nginx（解决 502：端口强一致）..."
-NGINX_SITE="/etc/nginx/sites-available/lxd-panel"
-if [[ "${BASE_PATH}" == "/" ]]; then
-cat > "${NGINX_SITE}" <<EOF
-server {
-  listen ${PANEL_PORT} default_server;
-  listen [::]:${PANEL_PORT} default_server;
-  server_name _;
-
-  root ${APP_DIR};
-  index index.html;
-
-  location / { try_files \$uri \$uri/ /index.html; }
-
-  location /api/ {
-    proxy_pass http://127.0.0.1:${BACKEND_PORT}/api/;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  }
-}
-EOF
-else
-cat > "${NGINX_SITE}" <<EOF
-server {
-  listen ${PANEL_PORT} default_server;
-  listen [::]:${PANEL_PORT} default_server;
-  server_name _;
-
-  location ${BASE_PATH}/ {
-    alias ${APP_DIR}/;
-    try_files \$uri \$uri/ ${BASE_PATH}/index.html;
-  }
-
-  location ${BASE_PATH}/api/ {
-    proxy_pass http://127.0.0.1:${BACKEND_PORT}/api/;
-    proxy_http_version 1.1;
-    proxy_set_header Host \$host;
-    proxy_set_header X-Real-IP \$remote_addr;
-    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-  }
-}
-EOF
-fi
-
-rm -f /etc/nginx/sites-enabled/default || true
-ln -sf /etc/nginx/sites-available/lxd-panel /etc/nginx/sites-enabled/lxd-panel
-nginx -t
-systemctl enable --now nginx
-systemctl restart nginx
-
-say "本地健康检查..."
-curl -fsS "http://127.0.0.1:${BACKEND_PORT}/api/health" >/dev/null && say "后端 OK" || warn "后端异常：journalctl -u lxd-panel -n 200 --no-pager"
-
 echo "------------------------------------------------------------"
-echo "✅ Panel 完成（先登录再配对节点）"
-echo "访问： http://<面板IP>:${PANEL_PORT}${BASE_PATH}/"
-echo "Admin：${ADMIN_USER}"
-echo "Pass ：${ADMIN_PASS}"
-echo "日志： journalctl -u lxd-panel -n 200 --no-pager"
+echo "✅ 安装成功！前端与通信后端已整合。"
+echo "访问地址： http://<你的IP>:${LISTEN_PORT}/"
+echo "账号： ${ADMIN_USER}"
+echo "密码： ${ADMIN_PASS}"
 echo "------------------------------------------------------------"
