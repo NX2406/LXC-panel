@@ -1,108 +1,105 @@
 #!/bin/bash
 # ==============================================================================
-# 项目名称: LXD Container Node + Panel Proxy (方案A) 一键安装脚本
-# 文件名称: lxd-agent-with-panel.sh
-# 运行环境: Debian 11+ / Ubuntu 20.04+ (需 Root 权限)
-#
+# 项目: LXD Hub (Go 单体版) - 一键安装脚本
 # 功能:
-# 1) 安装/初始化 LXD（snap）+ Agent(FastAPI) + Nginx(mTLS网关)
-# 2) 补齐后端 /list 接口（面板可列出容器）
-# 3) 安装 Node Proxy（负责 mTLS 转发，浏览器无需证书）
-# 4) 生成一个前端静态面板 panel.html（可直接打开或自行放到静态站点）
+# - 安装/初始化 LXD (snap)
+# - 生成 mTLS 证书 (CA/Server/Client)
+# - 编译并部署 Go 服务 (一个进程=Agent+Proxy+Panel)
+# - :443  mTLS API
+# - :18080 面板+API (Header Token 鉴权)
 #
-# 默认端口:
-# - 外部 mTLS 网关: 443 (Nginx)  -> 内部 Agent: 127.0.0.1:9042
-# - 面板 Proxy:     18080 (HTTP) -> 上游 mTLS: https://127.0.0.1:443
-#
-# 安全提醒:
-# - Proxy 端口 18080 不做鉴权（给局域网/内网用）。公网使用请自行加认证/仅允许特定IP访问。
+# 运行环境: Debian 11+ / Ubuntu 20.04+ (Root)
 # ==============================================================================
 
 set -euo pipefail
 
-# --- 全局配置 ---
-AGENT_DIR="/opt/lxd-agent"
-DATA_DIR="${AGENT_DIR}/data"
-CERT_DIR="${AGENT_DIR}/certs"
-PY_VENV="${AGENT_DIR}/.venv"
-
-UVICORN_PORT="9042"      # 内部 API 端口
-NGINX_HTTPS_PORT="443"   # 对外 mTLS 端口
-
-PROXY_DIR="/opt/lxd-panel-proxy"
-PROXY_PORT="18080"       # 面板代理端口 (HTTP)
-PANEL_HTML="${PROXY_DIR}/panel.html"
-
-# --- 颜色定义 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-# 检查 Root 权限
-[[ $EUID -ne 0 ]] && echo -e "${RED}错误：请使用 root 权限运行此脚本！${PLAIN}" && exit 1
-
-# --- 工具函数 ---
 log() { echo -e "${BLUE}[*]${PLAIN} $*"; }
 ok()  { echo -e "${GREEN}[OK]${PLAIN} $*"; }
 warn(){ echo -e "${YELLOW}[!]${PLAIN} $*"; }
+die() { echo -e "${RED}[X]${PLAIN} $*"; exit 1; }
 
-# ==============================================================================
-# 1) 安装系统依赖 + LXD
-# ==============================================================================
-install_env() {
-  echo -e "${YELLOW}[1/7] 安装系统依赖...${PLAIN}"
+[[ $EUID -ne 0 ]] && die "请使用 root 权限运行"
+
+APP_DIR="/opt/lxd-hub"
+BIN_PATH="${APP_DIR}/lxd-hub"
+CERT_DIR="${APP_DIR}/certs"
+DATA_DIR="${APP_DIR}/data"
+PANEL_DIR="${APP_DIR}/panel"
+
+MTLS_PORT="443"
+PANEL_PORT="18080"
+
+# ------------------------------------------------------------------------------
+# 1) 安装依赖
+# ------------------------------------------------------------------------------
+install_deps() {
+  echo -e "${YELLOW}[1/6] 安装依赖...${PLAIN}"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
+  apt-get install -y -qq curl jq openssl ufw ca-certificates >/dev/null
 
-  # 基础工具 + Nginx + Python + UFW
-  apt-get install -y -qq curl jq openssl nginx python3 python3-venv python3-pip ufw socat ca-certificates >/dev/null
-
-  # Node.js（尽量用系统仓库，够用；若你要更高版本可自行换 NodeSource）
-  apt-get install -y -qq nodejs npm >/dev/null || true
-
-  # 确保 snap 可用（Debian/Ubuntu 一般可装）
+  # snapd
   if ! command -v snap >/dev/null 2>&1; then
-    warn "未检测到 snap，正在安装 snapd..."
+    log "安装 snapd..."
     apt-get install -y -qq snapd >/dev/null
     systemctl enable --now snapd >/dev/null 2>&1 || true
   fi
 
-  # 安装 LXD（snap）
+  # Go（编译用）
+  if ! command -v go >/dev/null 2>&1; then
+    log "安装 golang（用于编译）..."
+    apt-get install -y -qq golang >/dev/null
+  fi
+
+  ok "依赖就绪"
+}
+
+# ------------------------------------------------------------------------------
+# 2) 安装/初始化 LXD
+# ------------------------------------------------------------------------------
+install_lxd() {
+  echo -e "${YELLOW}[2/6] 安装/初始化 LXD...${PLAIN}"
   if ! command -v lxc >/dev/null 2>&1; then
-    log "安装 LXD (snap)..."
+    log "snap install lxd"
     snap install lxd >/dev/null
-    # 初始化 LXD (默认配置)
-    log "初始化 LXD (lxd init --auto)..."
+    log "lxd init --auto"
     lxd init --auto >/dev/null
   else
-    ok "LXD 已安装"
+    ok "LXD 已存在"
   fi
 }
 
-# ==============================================================================
-# 2) 生成 mTLS 证书
-# ==============================================================================
-generate_certs() {
-  echo -e "${YELLOW}[2/7] 生成 mTLS 双向认证证书...${PLAIN}"
-  mkdir -p "${CERT_DIR}"
+# ------------------------------------------------------------------------------
+# 3) 生成证书 + 面板 Token
+# ------------------------------------------------------------------------------
+generate_secrets() {
+  echo -e "${YELLOW}[3/6] 生成证书与鉴权信息...${PLAIN}"
+  mkdir -p "${CERT_DIR}" "${DATA_DIR}" "${PANEL_DIR}"
 
-  # 获取一个可用的 IP（优先取第一个；如你要绑定公网 IP，可后续手工改 server.cnf）
   HOST_IP="$(hostname -I | awk '{print $1}')"
   [[ -z "${HOST_IP}" ]] && HOST_IP="127.0.0.1"
 
-  # (1) CA
+  # 面板 Token（用于 18080 的 Header 鉴权）
+  if [[ ! -f "${DATA_DIR}/panel.token" ]]; then
+    openssl rand -hex 16 > "${DATA_DIR}/panel.token"
+  fi
+
+  # mTLS CA
   if [[ ! -f "${CERT_DIR}/ca.crt" ]]; then
     openssl genrsa -out "${CERT_DIR}/ca.key" 4096 2>/dev/null
     openssl req -x509 -new -nodes -key "${CERT_DIR}/ca.key" -days 3650 \
-      -subj "/CN=LXD-Panel-CA" -out "${CERT_DIR}/ca.crt" 2>/dev/null
+      -subj "/CN=LXD-Hub-CA" -out "${CERT_DIR}/ca.crt" 2>/dev/null
   fi
 
-  # (2) Server cert (Nginx)
+  # Server cert（mTLS 服务端）
   if [[ ! -f "${CERT_DIR}/server.crt" ]]; then
     openssl genrsa -out "${CERT_DIR}/server.key" 2048 2>/dev/null
-
     cat > "${CERT_DIR}/server.cnf" <<EOF
 [req]
 default_bits = 2048
@@ -115,20 +112,18 @@ CN = ${HOST_IP}
 [req_ext]
 subjectAltName = IP:${HOST_IP}
 EOF
-
     openssl req -new -key "${CERT_DIR}/server.key" -config "${CERT_DIR}/server.cnf" \
       -out "${CERT_DIR}/server.csr" 2>/dev/null
-
     openssl x509 -req -in "${CERT_DIR}/server.csr" \
       -CA "${CERT_DIR}/ca.crt" -CAkey "${CERT_DIR}/ca.key" -CAcreateserial \
       -out "${CERT_DIR}/server.crt" -days 3650 \
       -extensions req_ext -extfile "${CERT_DIR}/server.cnf" 2>/dev/null
   fi
 
-  # (3) Client cert (Panel uses via Proxy)
+  # Client cert（外部调用 443 mTLS API 用）
   if [[ ! -f "${CERT_DIR}/client.crt" ]]; then
     openssl genrsa -out "${CERT_DIR}/client.key" 2048 2>/dev/null
-    openssl req -new -key "${CERT_DIR}/client.key" -subj "/CN=LXD-Panel-Client" \
+    openssl req -new -key "${CERT_DIR}/client.key" -subj "/CN=LXD-Hub-Client" \
       -out "${CERT_DIR}/client.csr" 2>/dev/null
     openssl x509 -req -in "${CERT_DIR}/client.csr" \
       -CA "${CERT_DIR}/ca.crt" -CAkey "${CERT_DIR}/ca.key" -CAcreateserial \
@@ -137,674 +132,739 @@ EOF
 
   chmod 644 "${CERT_DIR}"/*.crt
   chmod 600 "${CERT_DIR}"/*.key
-  ok "证书生成完成：${CERT_DIR}"
+  ok "证书与 Token 已生成"
 }
 
-# ==============================================================================
-# 3) 部署 FastAPI Agent（包含 /list）
-# ==============================================================================
-deploy_agent() {
-  echo -e "${YELLOW}[3/7] 部署 LXD 控制 Agent(FastAPI)...${PLAIN}"
-  mkdir -p "${AGENT_DIR}" "${DATA_DIR}"
+# ------------------------------------------------------------------------------
+# 4) 写 Go 源码 + 编译
+# ------------------------------------------------------------------------------
+build_go() {
+  echo -e "${YELLOW}[4/6] 编译 Go 服务...${PLAIN}"
+  mkdir -p "${APP_DIR}"
+  cat > "${APP_DIR}/main.go" <<'EOF'
+package main
 
-  # 生成本地通信密钥
-  if [[ ! -f "${DATA_DIR}/agent.key" ]]; then
-    openssl rand -hex 16 > "${DATA_DIR}/agent.key"
-  fi
+import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
 
-  # requirements
-  cat > "${AGENT_DIR}/requirements.txt" <<'EOF'
-fastapi
-uvicorn[standard]
-pydantic
+type ContainerReq struct {
+	Name    string `json:"name"`
+	Image   string `json:"image"`
+	CPU     int    `json:"cpu"`
+	Memory  int    `json:"memory"` // MB
+	Disk    int    `json:"disk"`   // GB
+	Ports   string `json:"ports"`  // "10001:22,10002:80"
+	Ingress *int   `json:"ingress"`
+	Egress  *int   `json:"egress"`
+}
+
+type Config struct {
+	AppDir     string
+	CertDir    string
+	DataDir    string
+	PanelDir   string
+	MtlsPort   int
+	PanelPort  int
+	PanelToken string
+}
+
+func mustReadFile(path string) []byte {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("read file failed: %s: %v", path, err)
+	}
+	return b
+}
+
+func readToken(path string) string {
+	b := mustReadFile(path)
+	return strings.TrimSpace(string(b))
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func bad(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]any{"error": msg})
+}
+
+func runCapture(timeout time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return "", fmt.Errorf("command timeout: %s %v", name, args)
+	}
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(out.String())
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("command failed: %s %v: %s", name, args, msg)
+	}
+	return out.String(), nil
+}
+
+func runOK(timeout time.Duration, name string, args ...string) error {
+	_, err := runCapture(timeout, name, args...)
+	return err
+}
+
+func validateReq(r *ContainerReq) error {
+	if strings.TrimSpace(r.Name) == "" {
+		return errors.New("name required")
+	}
+	if r.Image == "" {
+		r.Image = "images:debian/11"
+	}
+	if r.CPU <= 0 || r.CPU > 128 {
+		return errors.New("cpu must be 1..128")
+	}
+	if r.Memory < 128 || r.Memory > 1048576 {
+		return errors.New("memory(MB) must be 128..1048576")
+	}
+	if r.Disk < 1 || r.Disk > 1048576 {
+		return errors.New("disk(GB) must be 1..1048576")
+	}
+	if r.Ingress != nil && (*r.Ingress < 1 || *r.Ingress > 100000) {
+		return errors.New("ingress Mbps must be 1..100000")
+	}
+	if r.Egress != nil && (*r.Egress < 1 || *r.Egress > 100000) {
+		return errors.New("egress Mbps must be 1..100000")
+	}
+	return nil
+}
+
+func apiList(w http.ResponseWriter, _ *http.Request) {
+	out, err := runCapture(20*time.Second, "lxc", "list", "--format", "json")
+	if err != nil {
+		bad(w, 500, err.Error())
+		return
+	}
+	var v any
+	if err := json.Unmarshal([]byte(out), &v); err != nil {
+		bad(w, 500, "failed to parse lxc list output")
+		return
+	}
+	writeJSON(w, 200, v)
+}
+
+func apiCreate(w http.ResponseWriter, req *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(req.Body, 2<<20))
+	var c ContainerReq
+	if err := json.Unmarshal(body, &c); err != nil {
+		bad(w, 400, "invalid json")
+		return
+	}
+	if c.Image == "" {
+		c.Image = "images:debian/11"
+	}
+	if c.CPU == 0 {
+		c.CPU = 1
+	}
+	if c.Memory == 0 {
+		c.Memory = 512
+	}
+	if c.Disk == 0 {
+		c.Disk = 5
+	}
+	if err := validateReq(&c); err != nil {
+		bad(w, 400, err.Error())
+		return
+	}
+
+	// 1) launch
+	if err := runOK(180*time.Second, "lxc", "launch", c.Image, c.Name); err != nil {
+		bad(w, 500, err.Error())
+		return
+	}
+
+	// 2) limits
+	_ = runOK(15*time.Second, "lxc", "config", "set", c.Name, "limits.cpu", strconv.Itoa(c.CPU))
+	_ = runOK(15*time.Second, "lxc", "config", "set", c.Name, "limits.memory", fmt.Sprintf("%dMB", c.Memory))
+
+	// 3) disk
+	if err := runOK(15*time.Second, "lxc", "config", "device", "set", c.Name, "root", "size", fmt.Sprintf("%dGB", c.Disk)); err != nil {
+		_ = runOK(15*time.Second, "lxc", "config", "device", "override", c.Name, "root", fmt.Sprintf("size=%dGB", c.Disk))
+	}
+
+	// 4) net limits (eth0)
+	if c.Ingress != nil {
+		_ = runOK(15*time.Second, "lxc", "config", "device", "override", c.Name, "eth0", fmt.Sprintf("limits.ingress=%dMbit", *c.Ingress))
+	}
+	if c.Egress != nil {
+		_ = runOK(15*time.Second, "lxc", "config", "device", "override", c.Name, "eth0", fmt.Sprintf("limits.egress=%dMbit", *c.Egress))
+	}
+
+	// 5) ports proxy device
+	if strings.TrimSpace(c.Ports) != "" {
+		maps := strings.Split(c.Ports, ",")
+		idx := 0
+		for _, m := range maps {
+			m = strings.TrimSpace(m)
+			if m == "" || !strings.Contains(m, ":") {
+				continue
+			}
+			parts := strings.SplitN(m, ":", 2)
+			pub := strings.TrimSpace(parts[0])
+			priv := strings.TrimSpace(parts[1])
+			if pub == "" || priv == "" {
+				continue
+			}
+			if _, err := strconv.Atoi(pub); err != nil {
+				continue
+			}
+			if _, err := strconv.Atoi(priv); err != nil {
+				continue
+			}
+			devName := fmt.Sprintf("proxy%d", idx)
+			// connect 到容器 127.0.0.1:priv（与你原逻辑一致）
+			_ = runOK(15*time.Second, "lxc", "config", "device", "add", c.Name, devName, "proxy",
+				fmt.Sprintf("listen=tcp:0.0.0.0:%s", pub),
+				fmt.Sprintf("connect=tcp:127.0.0.1:%s", priv),
+			)
+			idx++
+		}
+	}
+
+	writeJSON(w, 200, map[string]any{"status": "created", "name": c.Name})
+}
+
+func apiDelete(w http.ResponseWriter, name string) {
+	if strings.TrimSpace(name) == "" {
+		bad(w, 400, "name required")
+		return
+	}
+	if err := runOK(60*time.Second, "lxc", "delete", name, "--force"); err != nil {
+		bad(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "deleted", "name": name})
+}
+
+func apiAction(w http.ResponseWriter, name, action string) {
+	action = strings.ToLower(strings.TrimSpace(action))
+	if action != "start" && action != "stop" && action != "restart" {
+		bad(w, 400, "invalid action")
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		bad(w, 400, "name required")
+		return
+	}
+	if err := runOK(60*time.Second, "lxc", action, name); err != nil {
+		bad(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "ok", "name": name, "action": action})
+}
+
+func withPanelToken(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 面板与面板 API 统一用 Header Token
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got := r.Header.Get("X-Panel-Token")
+		if got != token {
+			bad(w, 401, "missing/invalid X-Panel-Token")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func router(cfg Config) http.Handler {
+	mux := http.NewServeMux()
+
+	// health
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, 200, map[string]any{"ok": true})
+	})
+
+	// Panel static（简单起见：面板 HTML 文件）
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// 只提供面板文件
+		if r.URL.Path != "/" && r.URL.Path != "/panel.html" {
+			http.NotFound(w, r)
+			return
+		}
+		p := filepath.Join(cfg.PanelDir, "panel.html")
+		b, err := os.ReadFile(p)
+		if err != nil {
+			bad(w, 500, "panel not found")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(b)
+	})
+
+	// API
+	mux.HandleFunc("/api/list", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			bad(w, 405, "method not allowed")
+			return
+		}
+		apiList(w, r)
+	})
+
+	mux.HandleFunc("/api/create", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			bad(w, 405, "method not allowed")
+			return
+		}
+		apiCreate(w, r)
+	})
+
+	mux.HandleFunc("/api/delete/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			bad(w, 405, "method not allowed")
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/api/delete/")
+		apiDelete(w, name)
+	})
+
+	mux.HandleFunc("/api/action/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			bad(w, 405, "method not allowed")
+			return
+		}
+		rest := strings.TrimPrefix(r.URL.Path, "/api/action/")
+		parts := strings.Split(rest, "/")
+		if len(parts) != 2 {
+			bad(w, 400, "path must be /api/action/{name}/{action}")
+			return
+		}
+		apiAction(w, parts[0], parts[1])
+	})
+
+	return mux
+}
+
+func loadTLSConfig(certDir string) (*tls.Config, error) {
+	caPEM, err := os.ReadFile(filepath.Join(certDir, "ca.crt"))
+	if err != nil {
+		return nil, err
+	}
+	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, "server.crt"), filepath.Join(certDir, "server.key"))
+	if err != nil {
+		return nil, err
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("failed to append ca")
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+func localIP() string {
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP == nil {
+				continue
+			}
+			ip := ipnet.IP.To4()
+			if ip == nil {
+				continue
+			}
+			s := ip.String()
+			if s != "127.0.0.1" {
+				return s
+			}
+		}
+	}
+	return "127.0.0.1"
+}
+
+func main() {
+	cfg := Config{
+		AppDir:    "/opt/lxd-hub",
+		CertDir:   "/opt/lxd-hub/certs",
+		DataDir:   "/opt/lxd-hub/data",
+		PanelDir:  "/opt/lxd-hub/panel",
+		MtlsPort:  443,
+		PanelPort: 18080,
+	}
+
+	// env override（可选）
+	if v := os.Getenv("MTLS_PORT"); v != "" {
+		if p, _ := strconv.Atoi(v); p > 0 {
+			cfg.MtlsPort = p
+		}
+	}
+	if v := os.Getenv("PANEL_PORT"); v != "" {
+		if p, _ := strconv.Atoi(v); p > 0 {
+			cfg.PanelPort = p
+		}
+	}
+	cfg.PanelToken = readToken(filepath.Join(cfg.DataDir, "panel.token"))
+
+	// Router
+	base := router(cfg)
+
+	// Panel server（需要 Token）
+	panelSrv := &http.Server{
+		Addr:              fmt.Sprintf("0.0.0.0:%d", cfg.PanelPort),
+		Handler:           withPanelToken(cfg.PanelToken, base),
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// mTLS server（强认证，不需要 PanelToken）
+	mtlsTLS, err := loadTLSConfig(cfg.CertDir)
+	if err != nil {
+		log.Fatalf("tls config error: %v", err)
+	}
+	mtlsSrv := &http.Server{
+		Addr:              fmt.Sprintf("0.0.0.0:%d", cfg.MtlsPort),
+		Handler:           base,
+		TLSConfig:         mtlsTLS,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// 启动
+	go func() {
+		log.Printf("Panel+API: http://0.0.0.0:%d (requires X-Panel-Token)", cfg.PanelPort)
+		if err := panelSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("panel server error: %v", err)
+		}
+	}()
+
+	log.Printf("mTLS API: https://0.0.0.0:%d (client cert required)", cfg.MtlsPort)
+	ln, err := net.Listen("tcp", mtlsSrv.Addr)
+	if err != nil {
+		log.Fatalf("listen mtls error: %v", err)
+	}
+	tlsLn := tls.NewListener(ln, mtlsTLS)
+	if err := mtlsSrv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("mtls server error: %v", err)
+	}
+
+	_ = localIP()
+}
 EOF
 
-  # app.py（完整重写，带 /list）
-  cat > "${AGENT_DIR}/app.py" <<'PYTHON_EOF'
-import subprocess, shlex, json
-from typing import Optional, Any
-from fastapi import FastAPI, HTTPException, Request, Depends
-from pydantic import BaseModel, Field
-
-KEY_PATH = "/opt/lxd-agent/data/agent.key"
-try:
-    with open(KEY_PATH, "r") as f:
-        APP_KEY = f.read().strip()
-except Exception:
-    APP_KEY = "init_failed"
-
-app = FastAPI(title="LXD Agent", version="1.0.0")
-
-def verify_key(req: Request):
-    if req.headers.get("X-API-Key") != APP_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-
-def run_cmd(cmd: str) -> None:
-    try:
-        subprocess.check_call(shlex.split(cmd), stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"Command Error: {cmd}")
-
-def run_capture(cmd: str) -> str:
-    try:
-        out = subprocess.check_output(shlex.split(cmd), stderr=subprocess.STDOUT)
-        return out.decode("utf-8", errors="ignore")
-    except subprocess.CalledProcessError as e:
-        msg = e.output.decode("utf-8", errors="ignore") if e.output else ""
-        raise HTTPException(status_code=500, detail=f"Command Error: {cmd}\n{msg}")
-
-class ContainerReq(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64)
-    image: str = "images:debian/11"
-    cpu: int = Field(1, ge=1, le=128)
-    memory: int = Field(512, ge=128, le=1048576)  # MB
-    disk: int = Field(5, ge=1, le=1048576)        # GB
-    ports: Optional[str] = None                   # "10001:22,10002:80"
-    ingress: Optional[int] = Field(None, ge=1, le=100000)  # Mbps
-    egress: Optional[int] = Field(None, ge=1, le=100000)   # Mbps
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/list", dependencies=[Depends(verify_key)])
-def list_containers() -> Any:
-    out = run_capture("lxc list --format json")
-    try:
-        return json.loads(out)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to parse lxc list output")
-
-@app.post("/create", dependencies=[Depends(verify_key)])
-def create(c: ContainerReq):
-    # 1) 创建容器
-    run_cmd(f"lxc launch {c.image} {c.name}")
-
-    # 2) 资源限制
-    run_cmd(f"lxc config set {c.name} limits.cpu {c.cpu}")
-    run_cmd(f"lxc config set {c.name} limits.memory {c.memory}MB")
-
-    # 3) 磁盘限制
-    try:
-        run_cmd(f"lxc config device set {c.name} root size {c.disk}GB")
-    except HTTPException:
-        # 某些情况下 root 设备需要 override
-        run_cmd(f"lxc config device override {c.name} root size={c.disk}GB")
-
-    # 4) 网卡带宽限制（eth0）
-    if c.ingress:
-        run_cmd(f"lxc config device override {c.name} eth0 limits.ingress={c.ingress}Mbit")
-    if c.egress:
-        run_cmd(f"lxc config device override {c.name} eth0 limits.egress={c.egress}Mbit")
-
-    # 5) 端口映射（Proxy 设备）
-    if c.ports:
-        for i, mapping in enumerate(c.ports.split(",")):
-            mapping = mapping.strip()
-            if not mapping or ":" not in mapping:
-                continue
-            pub, priv = mapping.split(":", 1)
-            pub, priv = pub.strip(), priv.strip()
-            if not pub.isdigit() or not priv.isdigit():
-                continue
-            run_cmd(
-                f"lxc config device add {c.name} proxy{i} proxy "
-                f"listen=tcp:0.0.0.0:{pub} connect=tcp:127.0.0.1:{priv}"
-            )
-
-    return {"status": "created", "name": c.name}
-
-@app.delete("/delete/{name}", dependencies=[Depends(verify_key)])
-def delete(name: str):
-    run_cmd(f"lxc delete {name} --force")
-    return {"status": "deleted", "name": name}
-
-@app.post("/action/{name}/{action}", dependencies=[Depends(verify_key)])
-def action(name: str, action: str):
-    if action not in ["start", "stop", "restart"]:
-        raise HTTPException(status_code=400, detail="Invalid action")
-    run_cmd(f"lxc {action} {name}")
-    return {"status": "ok", "name": name, "action": action}
-PYTHON_EOF
-
-  # venv
-  if [[ ! -d "${PY_VENV}" ]]; then
-    python3 -m venv "${PY_VENV}"
-  fi
-  "${PY_VENV}/bin/pip" install -r "${AGENT_DIR}/requirements.txt" >/dev/null 2>&1
-
-  # systemd
-  cat > /etc/systemd/system/lxd-agent.service <<EOF
-[Unit]
-Description=LXD Control Agent API
-After=network.target snap.lxd.daemon.service
-Wants=snap.lxd.daemon.service
-
-[Service]
-WorkingDirectory=${AGENT_DIR}
-ExecStart=${PY_VENV}/bin/uvicorn app:app --host 127.0.0.1 --port ${UVICORN_PORT} --log-level warning
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now lxd-agent >/dev/null
-  ok "Agent 已启动：127.0.0.1:${UVICORN_PORT}"
-}
-
-# ==============================================================================
-# 4) 配置 Nginx mTLS 网关（443 -> 9042）
-# ==============================================================================
-configure_nginx_mtls() {
-  echo -e "${YELLOW}[4/7] 配置 Nginx(mTLS) 安全网关...${PLAIN}"
-  local APP_KEY
-  APP_KEY="$(cat "${DATA_DIR}/agent.key")"
-
-  cat > /etc/nginx/sites-available/lxd-agent <<EOF
-server {
-    listen ${NGINX_HTTPS_PORT} ssl;
-    server_name _;
-
-    ssl_certificate      ${CERT_DIR}/server.crt;
-    ssl_certificate_key  ${CERT_DIR}/server.key;
-
-    ssl_client_certificate ${CERT_DIR}/ca.crt;
-    ssl_verify_client on;
-
-    location / {
-        proxy_pass http://127.0.0.1:${UVICORN_PORT};
-        proxy_set_header X-API-Key "${APP_KEY}";
-        proxy_set_header Host \$host;
-    }
-}
-EOF
-
-  ln -sf /etc/nginx/sites-available/lxd-agent /etc/nginx/sites-enabled/lxd-agent
-  rm -f /etc/nginx/sites-enabled/default || true
-
-  nginx -t >/dev/null
-  systemctl restart nginx >/dev/null
-  ok "Nginx mTLS 网关已生效：443 -> 127.0.0.1:${UVICORN_PORT}"
-}
-
-# ==============================================================================
-# 5) 安装 Panel Proxy（Node/Express，负责 mTLS 转发）
-# ==============================================================================
-install_panel_proxy() {
-  echo -e "${YELLOW}[5/7] 安装 Panel Proxy(Node)...${PLAIN}"
-  mkdir -p "${PROXY_DIR}"
-  cd "${PROXY_DIR}"
-
-  # package.json
-  cat > "${PROXY_DIR}/package.json" <<'EOF'
-{
-  "name": "lxd-panel-proxy",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
-  "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
-  }
-}
-EOF
-
-  # server.js（上游默认 https://127.0.0.1:443；证书来自 /opt/lxd-agent/certs）
-  cat > "${PROXY_DIR}/server.js" <<'EOF'
-import fs from "fs";
-import https from "https";
-import express from "express";
-import cors from "cors";
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "2mb" }));
-
-const UPSTREAM_HOST = process.env.UPSTREAM_HOST || "127.0.0.1";
-const UPSTREAM_PORT = Number(process.env.UPSTREAM_PORT || "443");
-const CERT_DIR = process.env.CERT_DIR || "/opt/lxd-agent/certs";
-
-const ca = fs.readFileSync(`${CERT_DIR}/ca.crt`);
-const cert = fs.readFileSync(`${CERT_DIR}/client.crt`);
-const key = fs.readFileSync(`${CERT_DIR}/client.key`);
-
-function upstreamRequest(method, path, body) {
-  const options = {
-    hostname: UPSTREAM_HOST,
-    port: UPSTREAM_PORT,
-    path,
-    method,
-    ca,
-    cert,
-    key,
-    rejectUnauthorized: true,
-    headers: { "Content-Type": "application/json" }
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => {
-        const status = res.statusCode || 500;
-        const ct = res.headers["content-type"] || "";
-        if (ct.includes("application/json")) {
-          try { resolve({ status, data: JSON.parse(data || "{}") }); }
-          catch { resolve({ status, data: { raw: data } }); }
-        } else {
-          resolve({ status, data: { raw: data } });
-        }
-      });
-    });
-    req.on("error", reject);
-    if (body) req.write(JSON.stringify(body));
-    req.end();
-  });
-}
-
-app.get("/api/list", async (_req, res) => {
-  try {
-    const r = await upstreamRequest("GET", "/list", null);
-    res.status(r.status).json(r.data);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-app.post("/api/create", async (req, res) => {
-  try {
-    const r = await upstreamRequest("POST", "/create", req.body);
-    res.status(r.status).json(r.data);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-app.post("/api/action/:name/:action", async (req, res) => {
-  try {
-    const { name, action } = req.params;
-    const r = await upstreamRequest("POST", `/action/${encodeURIComponent(name)}/${encodeURIComponent(action)}`, null);
-    res.status(r.status).json(r.data);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-app.delete("/api/delete/:name", async (req, res) => {
-  try {
-    const { name } = req.params;
-    const r = await upstreamRequest("DELETE", `/delete/${encodeURIComponent(name)}`, null);
-    res.status(r.status).json(r.data);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-const listenPort = Number(process.env.PORT || "18080");
-app.listen(listenPort, "0.0.0.0", () => {
-  console.log(`lxd-panel-proxy listening on http://0.0.0.0:${listenPort}`);
-  console.log(`Upstream: https://${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
-});
-EOF
-
-  # 安装依赖
-  if ! command -v npm >/dev/null 2>&1; then
-    echo -e "${RED}错误：未找到 npm。请确认 nodejs/npm 已安装。${PLAIN}"
-    exit 1
-  fi
-  npm install --silent >/dev/null
-
-  # systemd 服务
-  cat > /etc/systemd/system/lxd-panel-proxy.service <<EOF
-[Unit]
-Description=LXD Panel Proxy (mTLS upstream)
-After=network.target nginx.service lxd-agent.service
-Wants=nginx.service lxd-agent.service
-
-[Service]
-WorkingDirectory=${PROXY_DIR}
-Environment=UPSTREAM_HOST=127.0.0.1
-Environment=UPSTREAM_PORT=${NGINX_HTTPS_PORT}
-Environment=CERT_DIR=${CERT_DIR}
-Environment=PORT=${PROXY_PORT}
-ExecStart=/usr/bin/node ${PROXY_DIR}/server.js
-Restart=always
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now lxd-panel-proxy >/dev/null
-  ok "Proxy 已启动：0.0.0.0:${PROXY_PORT}"
-}
-
-# ==============================================================================
-# 6) 生成前端面板 panel.html（静态文件）
-# ==============================================================================
-write_panel_html() {
-  echo -e "${YELLOW}[6/7] 生成前端面板 panel.html...${PLAIN}"
-  mkdir -p "${PROXY_DIR}"
-
-  cat > "${PANEL_HTML}" <<'EOF'
+  # 写前端 panel.html（保持“静态+零构建”）
+  cat > "${PANEL_DIR}/panel.html" <<'EOF'
 <!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>LXD Panel</title>
+  <title>LXD Hub Panel</title>
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-950 text-slate-100">
-  <div id="app" class="max-w-6xl mx-auto p-6 space-y-6">
-    <header class="flex items-center justify-between">
-      <div>
-        <h1 class="text-2xl font-semibold">LXD 管理面板</h1>
-        <p class="text-slate-400 text-sm">面板走 HTTP，mTLS 交给 Proxy 去扛。🛡️</p>
-      </div>
-      <div class="flex items-center gap-2">
-        <input v-model="proxyBase" class="w-80 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700"
-               placeholder="Proxy 地址，例如 http://1.2.3.4:18080" />
-        <button @click="refresh" class="px-4 py-2 rounded-xl bg-slate-100 text-slate-900 font-semibold">
-          刷新
-        </button>
-      </div>
-    </header>
+<div id="app" class="max-w-6xl mx-auto p-6 space-y-6">
+  <header class="flex items-center justify-between">
+    <div>
+      <h1 class="text-2xl font-semibold">LXD Hub 管理面板</h1>
+      <p class="text-slate-400 text-sm">Go 单体服务：一个进程把事情干漂亮。🧩</p>
+    </div>
+    <div class="flex items-center gap-2">
+      <input v-model="base" class="w-72 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700"
+             placeholder="例如 http://1.2.3.4:18080" />
+      <input v-model="token" class="w-72 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700"
+             placeholder="X-Panel-Token（安装脚本会输出）" />
+      <button @click="refresh" class="px-4 py-2 rounded-xl bg-slate-100 text-slate-900 font-semibold">刷新</button>
+    </div>
+  </header>
 
-    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-      <div class="lg:col-span-1 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-        <h2 class="text-lg font-semibold mb-4">创建容器</h2>
-
-        <div class="space-y-3">
-          <div>
-            <label class="text-sm text-slate-300">名称</label>
-            <input v-model="form.name" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="例如 demo-01"/>
-          </div>
-
-          <div>
-            <label class="text-sm text-slate-300">镜像</label>
-            <input v-model="form.image" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="images:debian/11"/>
-          </div>
-
-          <div class="grid grid-cols-3 gap-2">
-            <div>
-              <label class="text-sm text-slate-300">CPU</label>
-              <input v-model.number="form.cpu" type="number" min="1"
-                     class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/>
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">内存(MB)</label>
-              <input v-model.number="form.memory" type="number" min="128"
-                     class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/>
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">磁盘(GB)</label>
-              <input v-model.number="form.disk" type="number" min="1"
-                     class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/>
-            </div>
-          </div>
-
-          <div class="grid grid-cols-2 gap-2">
-            <div>
-              <label class="text-sm text-slate-300">入站限速(Mbps)</label>
-              <input v-model.number="form.ingress" type="number" min="0"
-                     class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="可空"/>
-            </div>
-            <div>
-              <label class="text-sm text-slate-300">出站限速(Mbps)</label>
-              <input v-model.number="form.egress" type="number" min="0"
-                     class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="可空"/>
-            </div>
-          </div>
-
-          <div>
-            <label class="text-sm text-slate-300">端口映射</label>
-            <input v-model="form.ports" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"
-                   placeholder="10001:22,10002:80 (可空)"/>
-          </div>
-
-          <button @click="create"
-                  class="w-full px-4 py-2 rounded-xl bg-emerald-400 text-slate-900 font-semibold">
-            创建
-          </button>
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+    <div class="lg:col-span-1 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+      <h2 class="text-lg font-semibold mb-4">创建容器</h2>
+      <div class="space-y-3">
+        <div>
+          <label class="text-sm text-slate-300">名称</label>
+          <input v-model="form.name" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="demo-01"/>
         </div>
+        <div>
+          <label class="text-sm text-slate-300">镜像</label>
+          <input v-model="form.image" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="images:debian/11"/>
+        </div>
+        <div class="grid grid-cols-3 gap-2">
+          <div><label class="text-sm text-slate-300">CPU</label>
+            <input v-model.number="form.cpu" type="number" min="1" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/></div>
+          <div><label class="text-sm text-slate-300">内存(MB)</label>
+            <input v-model.number="form.memory" type="number" min="128" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/></div>
+          <div><label class="text-sm text-slate-300">磁盘(GB)</label>
+            <input v-model.number="form.disk" type="number" min="1" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/></div>
+        </div>
+        <div class="grid grid-cols-2 gap-2">
+          <div><label class="text-sm text-slate-300">入站(Mbps)</label>
+            <input v-model.number="form.ingress" type="number" min="0" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="可空"/></div>
+          <div><label class="text-sm text-slate-300">出站(Mbps)</label>
+            <input v-model.number="form.egress" type="number" min="0" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="可空"/></div>
+        </div>
+        <div>
+          <label class="text-sm text-slate-300">端口映射</label>
+          <input v-model="form.ports" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="10001:22,10002:80 可空"/>
+        </div>
+        <button @click="create" class="w-full px-4 py-2 rounded-xl bg-emerald-400 text-slate-900 font-semibold">创建</button>
+        <p v-if="notice" class="text-sm text-slate-300"><span class="text-slate-400">提示：</span>{{notice}}</p>
+      </div>
+    </div>
 
-        <p v-if="notice" class="mt-4 text-sm text-slate-300">
-          <span class="text-slate-400">提示：</span>{{ notice }}
-        </p>
+    <div class="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-lg font-semibold">容器列表</h2>
+        <div class="flex items-center gap-2">
+          <input v-model="filter" class="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="搜索名称..."/>
+          <span class="text-sm text-slate-400">共 {{ filtered.length }} 个</span>
+        </div>
       </div>
 
-      <div class="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-lg font-semibold">容器列表</h2>
-          <div class="flex items-center gap-2">
-            <input v-model="filter" class="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"
-                   placeholder="搜索名称..." />
-            <span class="text-sm text-slate-400">共 {{ filtered.length }} 个</span>
+      <div v-if="loading" class="text-slate-400">加载中...</div>
+      <div v-else class="space-y-3">
+        <div v-for="c in filtered" :key="c.name"
+             class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4 flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <div class="flex items-center gap-2">
+              <div class="font-semibold truncate">{{ c.name }}</div>
+              <span class="text-xs px-2 py-1 rounded-full"
+                    :class="c.status==='Running' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                                 : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'">
+                {{ c.status }}
+              </span>
+            </div>
+            <div class="text-sm text-slate-400 mt-1 truncate">IPv4: {{ c.ipv4 || '-' }} · Image: {{ c.image || '-' }}</div>
+          </div>
+
+          <div class="flex items-center gap-2 shrink-0">
+            <button @click="act(c.name,'start')" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-900 font-semibold">Start</button>
+            <button @click="act(c.name,'stop')" class="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 border border-slate-700">Stop</button>
+            <button @click="act(c.name,'restart')" class="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 border border-slate-700">Restart</button>
+            <button @click="del(c.name)" class="px-3 py-2 rounded-xl bg-rose-500/90 text-white font-semibold">Delete</button>
           </div>
         </div>
 
-        <div v-if="loading" class="text-slate-400">加载中...</div>
-        <div v-else class="space-y-3">
-          <div v-for="c in filtered" :key="c.name"
-               class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4 flex items-center justify-between gap-4">
-            <div class="min-w-0">
-              <div class="flex items-center gap-2">
-                <div class="font-semibold truncate">{{ c.name }}</div>
-                <span class="text-xs px-2 py-1 rounded-full"
-                      :class="c.status === 'Running' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                                     : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'">
-                  {{ c.status }}
-                </span>
-              </div>
-              <div class="text-sm text-slate-400 mt-1 truncate">
-                IPv4: {{ c.ipv4 || '-' }} · Image: {{ c.image || '-' }}
-              </div>
-            </div>
-
-            <div class="flex items-center gap-2 shrink-0">
-              <button @click="doAction(c.name,'start')" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-900 font-semibold">Start</button>
-              <button @click="doAction(c.name,'stop')" class="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 border border-slate-700">Stop</button>
-              <button @click="doAction(c.name,'restart')" class="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 border border-slate-700">Restart</button>
-              <button @click="del(c.name)" class="px-3 py-2 rounded-xl bg-rose-500/90 text-white font-semibold">Delete</button>
-            </div>
-          </div>
-
-          <div v-if="!filtered.length" class="text-slate-400">没有匹配的容器。</div>
-        </div>
-
-        <div v-if="error" class="mt-4 rounded-xl border border-rose-800 bg-rose-950/40 p-3 text-rose-200 text-sm">
-          {{ error }}
-        </div>
+        <div v-if="!filtered.length" class="text-slate-400">没有匹配的容器。</div>
       </div>
-    </section>
 
-    <footer class="text-xs text-slate-500">
-      说明：该面板调用 proxy 的 /api/*；proxy 用客户端证书与节点 mTLS 网关通信。
-    </footer>
-  </div>
+      <div v-if="error" class="mt-4 rounded-xl border border-rose-800 bg-rose-950/40 p-3 text-rose-200 text-sm">{{ error }}</div>
+    </div>
+  </section>
+
+  <footer class="text-xs text-slate-500">
+    面板通过 Header: X-Panel-Token 鉴权；443 端口为 mTLS 强认证 API（给外部程序用）。
+  </footer>
+</div>
 
 <script>
 const { createApp } = Vue;
-
 createApp({
-  data() {
+  data(){
     return {
-      proxyBase: "http://127.0.0.1:18080",
-      loading: false,
-      error: "",
-      notice: "",
-      filter: "",
-      containers: [],
-      form: {
-        name: "",
-        image: "images:debian/11",
-        cpu: 1,
-        memory: 512,
-        disk: 5,
-        ports: "",
-        ingress: null,
-        egress: null
-      }
-    };
-  },
-  computed: {
-    filtered() {
-      const kw = this.filter.trim().toLowerCase();
-      return this.containers.filter(x => !kw || x.name.toLowerCase().includes(kw));
+      base: "http://127.0.0.1:18080",
+      token: "",
+      loading:false,
+      error:"",
+      notice:"",
+      filter:"",
+      containers:[],
+      form:{ name:"", image:"images:debian/11", cpu:1, memory:512, disk:5, ports:"", ingress:null, egress:null }
     }
   },
-  methods: {
-    async api(path, options = {}) {
-      const url = this.proxyBase.replace(/\/+$/, "") + path;
-      const res = await fetch(url, {
-        headers: { "Content-Type": "application/json" },
-        ...options
+  computed:{
+    filtered(){
+      const kw=this.filter.trim().toLowerCase();
+      return this.containers.filter(x=>!kw||x.name.toLowerCase().includes(kw));
+    }
+  },
+  methods:{
+    async api(path, opt={}){
+      const url=this.base.replace(/\/+$/,"")+path;
+      const res=await fetch(url,{
+        headers:{ "Content-Type":"application/json", "X-Panel-Token": this.token },
+        ...opt
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.detail || data?.error || JSON.stringify(data) || `HTTP ${res.status}`);
+      const data=await res.json().catch(()=>({}));
+      if(!res.ok) throw new Error(data?.error || data?.detail || `HTTP ${res.status}`);
       return data;
     },
-    normalizeList(raw) {
-      return (raw || []).map(item => {
-        const name = item?.name || item?.Name || "unknown";
-        const status = item?.status || item?.Status || item?.state?.status || "Unknown";
-        const image = item?.config?.["image.description"] || item?.expanded_config?.["image.description"] || "";
-        let ipv4 = "";
-        try {
-          const net = item?.state?.network || {};
-          for (const nic of Object.values(net)) {
-            const addrs = nic?.addresses || [];
-            const v4 = addrs.find(a => a.family === "inet");
-            if (v4?.address) { ipv4 = v4.address; break; }
+    normalize(raw){
+      return (raw||[]).map(it=>{
+        const name=it?.name||it?.Name||"unknown";
+        const status=String(it?.status||it?.Status||it?.state?.status||"Unknown");
+        const image=it?.config?.["image.description"]||it?.expanded_config?.["image.description"]||"";
+        let ipv4="";
+        try{
+          const net=it?.state?.network||{};
+          for(const nic of Object.values(net)){
+            const addrs=nic?.addresses||[];
+            const v4=addrs.find(a=>a.family==="inet");
+            if(v4?.address){ ipv4=v4.address; break; }
           }
-        } catch {}
-        return { name, status: String(status || ""), ipv4, image };
+        }catch(e){}
+        return {name,status,ipv4,image};
       }).sort((a,b)=>a.name.localeCompare(b.name));
     },
-    async refresh() {
-      this.error = "";
-      this.notice = "";
-      this.loading = true;
-      try {
-        const raw = await this.api("/api/list", { method: "GET" });
-        this.containers = this.normalizeList(raw);
-      } catch (e) {
-        this.error = String(e.message || e);
-      } finally {
-        this.loading = false;
-      }
+    async refresh(){
+      this.error=""; this.notice=""; this.loading=true;
+      try{
+        const raw=await this.api("/api/list",{method:"GET"});
+        this.containers=this.normalize(raw);
+      }catch(e){ this.error=String(e.message||e); }
+      finally{ this.loading=false; }
     },
-    async create() {
-      this.error = "";
-      this.notice = "";
-      if (!this.form.name.trim()) { this.notice = "容器名不能为空。"; return; }
-      const payload = { ...this.form };
-      if (!payload.ports) delete payload.ports;
-      if (!payload.ingress) delete payload.ingress;
-      if (!payload.egress) delete payload.egress;
-
-      try {
-        await this.api("/api/create", { method: "POST", body: JSON.stringify(payload) });
-        this.notice = "创建请求已提交。等它跑起来后，点刷新。";
+    async create(){
+      this.error=""; this.notice="";
+      if(!this.form.name.trim()){ this.notice="容器名不能为空"; return; }
+      const p={...this.form};
+      if(!p.ports) delete p.ports;
+      if(!p.ingress) delete p.ingress;
+      if(!p.egress) delete p.egress;
+      try{
+        await this.api("/api/create",{method:"POST",body:JSON.stringify(p)});
+        this.notice="创建已提交，稍等刷新。";
         await this.refresh();
-      } catch (e) {
-        this.error = String(e.message || e);
-      }
+      }catch(e){ this.error=String(e.message||e); }
     },
-    async doAction(name, action) {
-      this.error = "";
-      try {
-        await this.api(`/api/action/${encodeURIComponent(name)}/${encodeURIComponent(action)}`, { method: "POST" });
+    async act(name,action){
+      this.error="";
+      try{
+        await this.api(`/api/action/${encodeURIComponent(name)}/${encodeURIComponent(action)}`,{method:"POST"});
         await this.refresh();
-      } catch (e) {
-        this.error = String(e.message || e);
-      }
+      }catch(e){ this.error=String(e.message||e); }
     },
-    async del(name) {
-      this.error = "";
-      if (!confirm(`确认删除容器：${name} ？这一步不可逆。`)) return;
-      try {
-        await this.api(`/api/delete/${encodeURIComponent(name)}`, { method: "DELETE" });
+    async del(name){
+      this.error="";
+      if(!confirm(`确认删除 ${name}？不可逆。`)) return;
+      try{
+        await this.api(`/api/delete/${encodeURIComponent(name)}`,{method:"DELETE"});
         await this.refresh();
-      } catch (e) {
-        this.error = String(e.message || e);
-      }
+      }catch(e){ this.error=String(e.message||e); }
     }
   },
-  mounted() { this.refresh(); }
+  mounted(){ /* 不自动刷新，避免没填 token 就报错 */ }
 }).mount("#app");
 </script>
 </body>
 </html>
 EOF
 
-  ok "面板文件已生成：${PANEL_HTML}"
+  (cd "${APP_DIR}" && go build -o "${BIN_PATH}" main.go)
+  chmod +x "${BIN_PATH}"
+  ok "编译完成：${BIN_PATH}"
 }
 
-# ==============================================================================
-# 7) 防火墙放行（按需）
-# ==============================================================================
-configure_firewall() {
-  echo -e "${YELLOW}[7/7] 配置防火墙(UFW) 放行端口...${PLAIN}"
-  # mTLS 网关 443
-  ufw allow "${NGINX_HTTPS_PORT}/tcp" >/dev/null 2>&1 || true
-  # SSH
+# ------------------------------------------------------------------------------
+# 5) systemd 服务
+# ------------------------------------------------------------------------------
+install_service() {
+  echo -e "${YELLOW}[5/6] 配置 systemd 服务...${PLAIN}"
+  cat > /etc/systemd/system/lxd-hub.service <<EOF
+[Unit]
+Description=LXD Hub (Go single binary) - Panel+API + mTLS API
+After=network.target snap.lxd.daemon.service
+Wants=snap.lxd.daemon.service
+
+[Service]
+WorkingDirectory=${APP_DIR}
+ExecStart=${BIN_PATH}
+Restart=always
+RestartSec=2
+# 可选：覆盖端口
+Environment=MTLS_PORT=${MTLS_PORT}
+Environment=PANEL_PORT=${PANEL_PORT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now lxd-hub >/dev/null
+  ok "服务已启动：lxd-hub"
+}
+
+# ------------------------------------------------------------------------------
+# 6) 放行端口 + 输出信息
+# ------------------------------------------------------------------------------
+configure_firewall_and_print() {
+  echo -e "${YELLOW}[6/6] 配置防火墙与输出信息...${PLAIN}"
   ufw allow 22/tcp >/dev/null 2>&1 || true
-  # Proxy（注意：无鉴权，公网慎开！）
-  ufw allow "${PROXY_PORT}/tcp" >/dev/null 2>&1 || true
-  ok "已放行：443/tcp, 22/tcp, ${PROXY_PORT}/tcp（proxy）"
-}
+  ufw allow "${MTLS_PORT}/tcp" >/dev/null 2>&1 || true
+  ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
 
-# ==============================================================================
-# Token 输出（可选给“跨机器面板/代理”用；本机方案A通常不需要）
-# ==============================================================================
-show_token() {
-  local HOST_IP API_URL JSON_DATA TOKEN
   HOST_IP="$(hostname -I | awk '{print $1}')"
   [[ -z "${HOST_IP}" ]] && HOST_IP="127.0.0.1"
-  API_URL="https://${HOST_IP}:${NGINX_HTTPS_PORT}"
+  PANEL_TOKEN="$(cat "${DATA_DIR}/panel.token")"
 
+  # mTLS Token（给外部程序/别的面板导入用）
   JSON_DATA="$(jq -n \
-    --arg url "$API_URL" \
+    --arg url "https://${HOST_IP}:${MTLS_PORT}" \
     --arg ca "$(cat ${CERT_DIR}/ca.crt)" \
     --arg cert "$(cat ${CERT_DIR}/client.crt)" \
     --arg key "$(cat ${CERT_DIR}/client.key)" \
-    '{api_url: $url, ca_cert: $ca, client_cert: $cert, client_key: $key}')"
-
-  TOKEN="$(echo "$JSON_DATA" | base64 -w0)"
+    '{api_url:$url, ca_cert:$ca, client_cert:$cert, client_key:$key}')"
+  MTLS_TOKEN="$(echo "$JSON_DATA" | base64 -w0)"
 
   echo -e "\n${GREEN}==============================================${PLAIN}"
-  echo -e "${GREEN}  安装完成：LXD Agent + Nginx(mTLS) + Panel Proxy${PLAIN}"
+  echo -e "${GREEN}  LXD Hub 安装完成（Go 单体版）${PLAIN}"
   echo -e "${GREEN}==============================================${PLAIN}"
-  echo -e "Agent (本机):       http://127.0.0.1:${UVICORN_PORT}"
-  echo -e "mTLS 网关(对外):    https://${HOST_IP}:${NGINX_HTTPS_PORT}"
-  echo -e "Panel Proxy(对外):  http://${HOST_IP}:${PROXY_PORT}"
-  echo -e "面板文件:           ${PANEL_HTML}"
+  echo -e "面板地址:     http://${HOST_IP}:${PANEL_PORT}   （需要 X-Panel-Token）"
+  echo -e "面板文件:     ${PANEL_DIR}/panel.html"
+  echo -e "面板 Token:   ${YELLOW}${PANEL_TOKEN}${PLAIN}"
   echo -e ""
-  echo -e "${YELLOW}面板使用方法：${PLAIN}"
-  echo -e "1) 把 ${PANEL_HTML} 下载到本地（或用浏览器直接打开）"
-  echo -e "2) 面板里 Proxy 地址填： http://${HOST_IP}:${PROXY_PORT}"
+  echo -e "mTLS API:     https://${HOST_IP}:${MTLS_PORT}   （客户端证书认证）"
+  echo -e "mTLS 导入Token（含证书）:"
+  echo -e "${YELLOW}${MTLS_TOKEN}${PLAIN}"
   echo -e ""
-  echo -e "${YELLOW}如需给“外部面板/外部代理”导入证书，可用下方 Token：${PLAIN}"
-  echo -e "${YELLOW}${TOKEN}${PLAIN}"
-  echo -e ""
-  warn "安全提示：Proxy 端口 ${PROXY_PORT} 默认无鉴权，公网开放请加认证或限制 IP！"
+  warn "安全建议：18080 仍建议只对内网开放，或你让我加 IP 白名单/HTTPS/登录。"
 }
 
-# ==============================================================================
-# 主流程
-# ==============================================================================
-install_env
-generate_certs
-deploy_agent
-configure_nginx_mtls
-install_panel_proxy
-write_panel_html
-configure_firewall
-show_token
+# ------------------------------------------------------------------------------
+# Run
+# ------------------------------------------------------------------------------
+install_deps
+install_lxd
+generate_secrets
+build_go
+install_service
+configure_firewall_and_print
