@@ -43,4 +43,10 @@ graph LR
 
     subgraph "安全层 (Security)"
     Node1 --- Cert["客户端证书校验"]
-    end
+
+# 使用方法 (Root 用户)
+
+直接在终端执行以下命令即可：
+
+```bash
+bash <(curl -sL https://raw.githubusercontent.com/NX2406/vps-tools/main/ipv6_magic.sh)
