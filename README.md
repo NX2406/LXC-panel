@@ -1,52 +1,18 @@
-<div align="center">
+# LXD 集中管理面板 (LXD Panel) 一键部署脚本
 
-# LXD Panel 全能一键安装 & 中央控制台
+这是一个现代化的 LXD 集中管理面板，旨在解决多台 LXD 宿主机的管理难题。它不依赖复杂的数据库或重量级组件，采用 mTLS (双向 TLS 认证) 技术与宿主机 Agent 通信，确保只有经过授权的面板才能控制您的服务器，极大提升了安全性。
 
-**轻量级 · 高安全 · 集中化**
-<br>
-专为 LXD 打造的多节点管理控制台，基于 FastAPI + Vue 构建。
+## 功能特点
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?style=flat-square&logo=fastapi)](https://fastapi.tiangolo.com/)
-[![Vue](https://img.shields.io/badge/Frontend-Vue.js-4FC08D?style=flat-square&logo=vue.js)](https://vuejs.org/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
+* 🚀 **极速部署**: 没有任何复杂的依赖，集成 Nginx、Python 环境，一键启动，开箱即用
+* 🔒 **银行级安全**: 节点通信全链路加密，采用 mTLS 双向认证，拒绝任何未经授权的 IP 访问
+* 📦 **容器全生命周期**: 支持创建、启动、停止、重启、强制销毁容器，管理更加从容
+* ⚖️ **资源精细控制**: 支持限制 CPU 核心、内存大小、磁盘配额，以及网络宽带 (QoS) 入站/出站限速
+* 👥 **多租户隔离**: 容器名称自动添加用户前缀 (如 `u_1001_web01`)，防止命名冲突，适合多用户场景
 
-[功能特性](#-功能特性) • [一键安装](#-使用方法-root-用户) • [添加节点](#-配套-agent-安装)
-
-</div>
-
----
-
-## 📖 项目简介
-
-这是一个现代化的 LXD 集中管理面板，旨在解决多台 LXD 宿主机的管理难题。它不依赖复杂的数据库或重量级组件，仅需一条命令即可部署。
-
-与传统的 SSH 管理不同，本系统采用 **mTLS (双向 TLS 认证)** 技术与宿主机 Agent 通信，确保只有经过授权的面板才能控制您的服务器，极大提升了安全性。
-
-## ✨ 功能特点
-
-* 🚀 **极速部署**: 没有任何复杂的依赖，集成 Nginx、Python 环境，一键启动，开箱即用。
-* 🔒 **银行级安全**: 节点通信全链路加密，采用 mTLS 双向认证，拒绝任何未经授权的 IP 访问。
-* 📦 **容器全生命周期**: 支持创建、启动、停止、重启、强制销毁容器，管理更加从容。
-* ⚖️ **资源精细控制**: 支持限制 CPU 核心、内存大小、磁盘配额，以及**网络宽带 (QoS)** 入站/出站限速。
-* 👥 **多租户隔离**: 容器名称自动添加用户前缀 (如 `u_1001_web01`)，防止命名冲突，适合多用户场景。
-
-## 🛡️ 核心架构
-
-```mermaid
-graph LR
-    User["管理员/用户"] -->|HTTPS| Panel["LXD Panel (本控制台)"]
-    Panel -->|mTLS 加密通道| Node1["宿主机 A (Agent)"]
-    Panel -->|mTLS 加密通道| Node2["宿主机 B (Agent)"]
-    Panel -->|mTLS 加密通道| Node3["宿主机 C (Agent)"]
-
-
-    subgraph "安全层 (Security)"
-    Node1 --- Cert["客户端证书校验"]
-
-# 使用方法 (Root 用户)
+## 使用方法 (Root 用户)
 
 直接在终端执行以下命令即可：
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/NX2406/vps-tools/main/ipv6_magic.sh)
+bash <(curl -sL (https://raw.githubusercontent.com/NX2406/LXC-panel/main/panel)
