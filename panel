@@ -1,47 +1,126 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==============================================================
-# LXD Control Panel - 一键部署脚本
-# 集成：FastAPI 后端 + 原生 HTML 前端 + Nginx 反代 + Systemd
-# ==============================================================
+# =========================
+# LXD Panel Secure - OneKey
+# (Front+Backend+Nginx+Systemd)
+# =========================
 
-# 配置路径
 APP_DIR="/opt/lxd-panel"
-BACKEND_DIR="${APP_DIR}/backend"
-FRONTEND_DIR="${APP_DIR}/frontend"
 DATA_DIR="${APP_DIR}/data"
 CERT_CACHE="${APP_DIR}/cert-cache"
 LOG_DIR="/var/log/lxd-panel"
-PY_VENV="${BACKEND_DIR}/.venv"
-API_PORT="8089"
+PY_VENV="${APP_DIR}/.venv"
 
-# 颜色
-GREEN='\033[0;32m'
-NC='\033[0m'
+say()  { echo -e "\033[1;36m[*]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
+err()  { echo -e "\033[1;31m[✗]\033[0m $*"; }
 
-echo -e "${GREEN}[1/7] 安装系统依赖...${NC}"
-apt-get update -qq
-apt-get install -y -qq curl nginx python3 python3-venv python3-pip jq openssl
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    err "请使用 root 运行：sudo bash panel_onekey.sh"
+    exit 1
+  fi
+}
 
-echo -e "${GREEN}[2/7] 初始化目录结构...${NC}"
-mkdir -p "${BACKEND_DIR}" "${FRONTEND_DIR}" "${DATA_DIR}" "${CERT_CACHE}" "${LOG_DIR}"
+ask() {
+  local prompt="$1"
+  local def="$2"
+  local var
+  read -r -p "${prompt}（默认 ${def}）: " var
+  echo "${var:-$def}"
+}
+
+ask_yn() {
+  local prompt="$1"
+  local def="$2" # y/n
+  local var
+  read -r -p "${prompt} (y/n，默认 ${def}): " var
+  var="${var:-$def}"
+  var="$(echo "$var" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$var" != "y" && "$var" != "n" ]]; then
+    echo "$def"
+  else
+    echo "$var"
+  fi
+}
+
+normalize_base_path() {
+  local p="$1"
+  p="${p:-/}"
+  if [[ "$p" == "/" ]]; then
+    echo "/"
+    return
+  fi
+  p="/$(echo "$p" | sed 's#^/*##; s#/*$##')"
+  echo "$p"
+}
+
+write_file() {
+  local path="$1"
+  shift
+  mkdir -p "$(dirname "$path")"
+  cat > "$path" <<'EOF'
+'"$@"'
+EOF
+}
+
+need_root
+
+say "LXD Panel（一键安装，安全优先 mTLS + Key 架构的面板端）"
+PANEL_PORT="$(ask "1) 面板对外端口（Nginx listen）" "80")"
+BACKEND_PORT="$(ask "2) 面板后端端口（uvicorn）" "8089")"
+BASE_PATH_RAW="$(ask "3) 面板访问路径（/ 或 /panel）" "/")"
+BASE_PATH="$(normalize_base_path "$BASE_PATH_RAW")"
+
+CUSTOM_ADMIN="$(ask_yn "4) admin 账号密码是否自定义？" "n")"
+ADMIN_USER="admin"
+ADMIN_PASS="ChangeMeNow!"
+if [[ "${CUSTOM_ADMIN}" == "y" ]]; then
+  ADMIN_USER="$(ask "   - admin 用户名" "admin")"
+  read -r -p "   - admin 密码（建议强密码，留空则仍用默认）: " ADMIN_PASS_IN
+  if [[ -n "${ADMIN_PASS_IN}" ]]; then
+    ADMIN_PASS="${ADMIN_PASS_IN}"
+  fi
+fi
+
+WANT_TLS="$(ask_yn "5) 面板是否申请 HTTPS 证书（Let’s Encrypt，需要域名）？" "n")"
+TLS_MODE="none"
+DOMAIN="_"
+EMAIL=""
+if [[ "${WANT_TLS}" == "y" ]]; then
+  TLS_MODE="letsencrypt"
+  read -r -p "   - 输入绑定到本机的域名（如 panel.example.com）: " DOMAIN_IN
+  DOMAIN="${DOMAIN_IN:-_}"
+  read -r -p "   - 输入邮箱（Let’s Encrypt 用）: " EMAIL
+fi
+
+say "参数确认："
+echo "  - Nginx 端口: ${PANEL_PORT}"
+echo "  - 后端端口:   ${BACKEND_PORT}"
+echo "  - 访问路径:   ${BASE_PATH}"
+echo "  - Admin:      ${ADMIN_USER}"
+echo "  - TLS:        ${TLS_MODE} (domain=${DOMAIN})"
+echo
+
+say "安装依赖..."
+apt-get update -y
+apt-get install -y nginx python3 python3-venv python3-pip openssl jq curl
+
+if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
+  say "安装 certbot..."
+  apt-get install -y certbot python3-certbot-nginx
+fi
+
+say "创建目录..."
+mkdir -p "${APP_DIR}" "${DATA_DIR}" "${CERT_CACHE}" "${LOG_DIR}"
 chmod 700 "${CERT_CACHE}" || true
 
-echo -e "${GREEN}[3/7] 写入后端代码 (FastAPI)...${NC}"
-
-# 1. requirements.txt
-cat > "${BACKEND_DIR}/requirements.txt" <<'REQ_EOF'
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-python-jose==3.3.0
-passlib[bcrypt]==1.7.4
-pydantic==2.8.2
-httpx==0.27.2
-REQ_EOF
-
-# 2. app.py
-cat > "${BACKEND_DIR}/app.py" <<'PY_EOF'
+# =========================
+# Write backend app.py
+# =========================
+say "写入后端 app.py..."
+cat > "${APP_DIR}/app.py" <<'PY'
 import os, re, time, sqlite3, base64, json
 from typing import Optional, List, Dict, Any
 import httpx
@@ -58,6 +137,10 @@ CERT_CACHE = os.environ.get("LXD_PANEL_CERT_CACHE", "/opt/lxd-panel/cert-cache")
 JWT_ALG = "HS256"
 TOKEN_TTL_SECONDS = 12 * 3600
 
+# install.sh 会注入；首次启动若无 admin 则 seed
+SEED_ADMIN_USER = os.environ.get("LXD_PANEL_ADMIN_USER", "admin")
+SEED_ADMIN_PASS = os.environ.get("LXD_PANEL_ADMIN_PASS", "ChangeMeNow!")
+
 ALLOWED_IMAGES = [
     "images:ubuntu/22.04",
     "images:ubuntu/24.04",
@@ -70,6 +153,9 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # 稳定性：WAL 更适合并发读写
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 def init_db():
@@ -98,11 +184,12 @@ def init_db():
     """)
     conn.commit()
 
-    cur.execute("SELECT id FROM users WHERE username='admin'")
+    # 只在不存在任何 admin 时 seed
+    cur.execute("SELECT id FROM users WHERE role='admin' LIMIT 1")
     if not cur.fetchone():
         cur.execute(
             "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-            ("admin", pwd_ctx.hash("ChangeMeNow!"), "admin", int(time.time()))
+            (SEED_ADMIN_USER, pwd_ctx.hash(SEED_ADMIN_PASS), "admin", int(time.time()))
         )
         conn.commit()
     conn.close()
@@ -172,7 +259,6 @@ def _write_cert_files(node: sqlite3.Row) -> Dict[str, str]:
     write_if_changed(ca_path, node["ca_pem"], 0o644)
     write_if_changed(crt_path, node["client_cert_pem"], 0o644)
     write_if_changed(key_path, node["client_key_pem"], 0o600)
-
     return {"ca": ca_path, "crt": crt_path, "key": key_path}
 
 async def agent_call(node: sqlite3.Row, method: str, path: str, json_body: Optional[dict]=None) -> dict:
@@ -180,7 +266,8 @@ async def agent_call(node: sqlite3.Row, method: str, path: str, json_body: Optio
     headers = {"X-Panel-Key": node["panel_key"]}
     files = _write_cert_files(node)
 
-    timeout = httpx.Timeout(20.0, read=180.0)
+    # 关键：不让前端“卡住”，超时要明确抛出
+    timeout = httpx.Timeout(8.0, read=60.0)
     async with httpx.AsyncClient(
         timeout=timeout,
         verify=files["ca"],
@@ -198,11 +285,6 @@ async def agent_call(node: sqlite3.Row, method: str, path: str, json_body: Optio
 class LoginReq(BaseModel):
     username: str
     password: str
-
-class CreateUserReq(BaseModel):
-    username: str
-    password: str
-    role: str = "user"
 
 class AddNodeBundleReq(BaseModel):
     bundle_b64: str
@@ -230,7 +312,7 @@ app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 生产建议改成你的域名
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -242,7 +324,7 @@ def _startup():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "app": APP_NAME}
+    return {"ok": True, "app": APP_NAME, "ts": int(time.time())}
 
 @app.post("/api/login")
 def login(body: LoginReq):
@@ -263,24 +345,6 @@ def me(user=Depends(current_user)):
 @app.get("/api/images")
 def images(user=Depends(current_user)):
     return {"items": ALLOWED_IMAGES}
-
-@app.post("/api/admin/users")
-def admin_create_user(body: CreateUserReq, admin=Depends(require_admin)):
-    if body.role not in ("admin", "user"):
-        raise HTTPException(status_code=400, detail="role must be admin/user")
-    conn = db()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
-            (body.username, pwd_ctx.hash(body.password), body.role, int(time.time()))
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="username exists")
-    finally:
-        conn.close()
-    return {"ok": True}
 
 @app.post("/api/admin/nodes/bundle")
 async def admin_add_node_bundle(body: AddNodeBundleReq, admin=Depends(require_admin)):
@@ -309,7 +373,7 @@ async def admin_add_node_bundle(body: AddNodeBundleReq, admin=Depends(require_ad
     node_id = cur.lastrowid
     conn.close()
 
-    # 立即健康检查
+    # 添加后立刻健康检查，失败直接返回错误（不让 UI 假卡）
     node = get_node(node_id)
     await agent_call(node, "GET", "/agent/health")
 
@@ -389,10 +453,13 @@ async def exec_cmd(body: ExecReq, user=Depends(current_user)):
     node = get_node(body.node_id)
     data = await agent_call(node, "POST", f"/agent/containers/{owned_name(user, body.name)}/exec", json_body={"cmd": body.cmd})
     return {"ok": True, "output": data.get("output","")}
-PY_EOF
+PY
 
-echo -e "${GREEN}[4/7] 写入前端代码 (HTML)...${NC}"
-cat > "${FRONTEND_DIR}/index.html" <<'HTML_EOF'
+# =========================
+# Write frontend index.html
+# =========================
+say "写入前端 index.html..."
+cat > "${APP_DIR}/index.html" <<'HTML'
 <!doctype html>
 <html lang="zh-CN">
 <head>
@@ -426,6 +493,7 @@ cat > "${FRONTEND_DIR}/index.html" <<'HTML_EOF'
     <div>
       <div style="font-weight:800">🛡️ LXD Panel <span class="muted" style="font-size:12px">mTLS + Key</span></div>
       <div class="muted" id="who">未登录</div>
+      <div class="muted" id="apiStatus" style="font-size:12px"></div>
     </div>
     <div class="row"><button class="ghost" onclick="logout()">退出</button></div>
   </div>
@@ -498,38 +566,79 @@ cat > "${FRONTEND_DIR}/index.html" <<'HTML_EOF'
 </div>
 
 <script>
-const API="/api";
-let token=localStorage.getItem("token")||"";
-let me=null;
+const BASE = "__BASE_PATH__";               // one-key 脚本会替换
+const API  = (BASE === "/" ? "" : BASE) + "/api";
+
+let token = localStorage.getItem("token") || "";
+let me = null;
 
 function h(){ return token ? {"Authorization":"Bearer "+token} : {}; }
 function msg(id,t){ document.getElementById(id).innerText=t||""; }
 
+async function fetchWithTimeout(url, options={}, ms=12000){
+  const controller = new AbortController();
+  const id = setTimeout(()=>controller.abort(), ms);
+  try{
+    const r = await fetch(url, {...options, signal: controller.signal});
+    clearTimeout(id);
+    return r;
+  }catch(e){
+    clearTimeout(id);
+    throw e;
+  }
+}
+
+async function probeAPI(){
+  try{
+    const r = await fetchWithTimeout(API + "/health", {}, 4000);
+    if(!r.ok) throw new Error("bad status");
+    const j = await r.json();
+    msg("apiStatus", `API：在线 ✅  (${j.app})`);
+  }catch(e){
+    msg("apiStatus", `API：不可用 ❌  (检查 Nginx 反代/后端服务/路径前缀)`);
+  }
+}
+
 async function login(){
   msg("loginMsg","登录中...");
-  const r=await fetch(API+"/login",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({username:u.value.trim(),password:p.value})});
-  const j=await r.json();
-  if(!r.ok){ msg("loginMsg", j.detail||"登录失败"); return; }
-  token=j.token; localStorage.setItem("token",token);
-  await boot();
+  try{
+    const r = await fetchWithTimeout(API + "/login", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json" },
+      body: JSON.stringify({username:u.value.trim(), password:p.value})
+    }, 12000);
+
+    let j = {};
+    try { j = await r.json(); } catch(_) {}
+
+    if(!r.ok){
+      msg("loginMsg", j.detail || `登录失败：HTTP ${r.status}（检查后端/反代/路径）`);
+      return;
+    }
+    token = j.token;
+    localStorage.setItem("token", token);
+    await boot();
+  }catch(e){
+    msg("loginMsg", "登录超时/网络错误：请检查 API 反代、后端服务是否运行、访问路径是否一致");
+  }
 }
 
 function logout(){ token=""; localStorage.removeItem("token"); location.reload(); }
 
 async function boot(){
-  const r=await fetch(API+"/me",{headers:h()});
+  const r = await fetchWithTimeout(API + "/me", {headers:h()}, 8000);
   if(!r.ok){ logout(); return; }
-  me=await r.json();
-  who.innerText=`已登录：${me.username}（${me.role}） uid=${me.uid}`;
-  loginCard.style.display="none";
-  nodeCard.style.display="";
-  createCard.style.display="";
-  listCard.style.display="";
-  adminBox.style.display = (me.role==="admin") ? "" : "none";
+  me = await r.json();
 
-  const ir=await fetch(API+"/images",{headers:h()});
-  const ij=await ir.json();
+  who.innerText = `已登录：${me.username}（${me.role}） uid=${me.uid}`;
+  loginCard.style.display = "none";
+  nodeCard.style.display  = "";
+  createCard.style.display= "";
+  listCard.style.display  = "";
+  adminBox.style.display  = (me.role==="admin") ? "" : "none";
+
+  const ir = await fetchWithTimeout(API + "/images", {headers:h()}, 8000);
+  const ij = await ir.json();
   image.innerHTML="";
   (ij.items||[]).forEach(x=>{ const o=document.createElement("option"); o.value=x; o.textContent=x; image.appendChild(o); });
 
@@ -538,33 +647,37 @@ async function boot(){
 
 async function addNodeBundle(){
   msg("nodeMsg","添加中...");
-  const b=bundle.value.trim();
-  const r=await fetch(API+"/admin/nodes/bundle",{method:"POST",headers:{"Content-Type":"application/json",...h()},body:JSON.stringify({bundle_b64:b})});
-  const j=await r.json();
-  if(!r.ok){ msg("nodeMsg", j.detail||"添加失败"); return; }
-  msg("nodeMsg", `添加成功 ✅ node_id=${j.node_id}`);
-  bundle.value="";
-  await loadNodes();
+  try{
+    const r = await fetchWithTimeout(API + "/admin/nodes/bundle", {
+      method:"POST",
+      headers:{"Content-Type":"application/json", ...h()},
+      body: JSON.stringify({bundle_b64: bundle.value.trim()})
+    }, 20000);
+
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok){ msg("nodeMsg", j.detail || "添加失败"); return; }
+    msg("nodeMsg", `添加成功 ✅ node_id=${j.node_id}`);
+    bundle.value="";
+    await loadNodes();
+  }catch(e){
+    msg("nodeMsg","请求超时/网络错误：检查 Panel->Agent 公网连通、证书、Agent 白名单");
+  }
 }
 
 async function loadNodes(){
-  const r=await fetch(API+"/nodes",{headers:h()});
-  const j=await r.json();
+  const r = await fetchWithTimeout(API + "/nodes", {headers:h()}, 8000);
+  const j = await r.json();
   nodeSel.innerHTML="";
   (j.items||[]).forEach(n=>{
     const o=document.createElement("option");
     o.value=n.id; o.textContent=`#${n.id} ${n.name} (${n.base_url})`;
     nodeSel.appendChild(o);
   });
-  if((j.items||[]).length===0){
-    tbody.innerHTML="";
-    return;
-  }
+  if((j.items||[]).length===0){ tbody.innerHTML=""; return; }
   await refreshContainers();
 }
 
 function nodeId(){ return parseInt(nodeSel.value||"0",10); }
-
 function badge(s){
   s=(s||"").toLowerCase();
   if(s==="running") return `<span class="badge ok">running</span>`;
@@ -573,10 +686,9 @@ function badge(s){
 }
 
 async function refreshContainers(){
-  const nid=nodeId();
-  if(!nid) return;
-  const r=await fetch(API+`/containers?node_id=${nid}`,{headers:h()});
-  const j=await r.json();
+  const nid=nodeId(); if(!nid) return;
+  const r = await fetchWithTimeout(API + `/containers?node_id=${nid}`, {headers:h()}, 15000);
+  const j = await r.json();
   tbody.innerHTML="";
   (j.items||[]).forEach(it=>{
     const full=it.name||"";
@@ -597,12 +709,16 @@ async function refreshContainers(){
 }
 
 async function op(name, action){
-  const nid=nodeId();
-  if(!nid) return;
+  const nid=nodeId(); if(!nid) return;
   if(action==="delete" && !confirm("确定删除？这会强制删除容器。")) return;
-  const r=await fetch(API+`/containers/${action}`,{method:"POST",headers:{"Content-Type":"application/json",...h()},
-    body:JSON.stringify({node_id:nid,name})});
-  const j=await r.json().catch(()=>({}));
+
+  const r = await fetchWithTimeout(API + `/containers/${action}`, {
+    method:"POST",
+    headers:{"Content-Type":"application/json",...h()},
+    body: JSON.stringify({node_id:nid, name})
+  }, 15000);
+
+  const j = await r.json().catch(()=>({}));
   if(!r.ok){ alert(j.detail||"操作失败"); return; }
   await refreshContainers();
 }
@@ -611,13 +727,19 @@ async function createContainer(){
   const nid=nodeId();
   if(!nid){ msg("createMsg","请先选择节点"); return; }
   msg("createMsg","创建中（首次拉镜像可能较慢）...");
+
   const body={node_id:nid,name:cname.value.trim(),image:image.value,
     cpu:parseInt(cpu.value||"1",10),memory_mb:parseInt(mem.value||"512",10),disk_gb:parseInt(disk.value||"8",10)};
   if(ing.value.trim()) body.ingress_mbit=parseInt(ing.value.trim(),10);
   if(eg.value.trim()) body.egress_mbit=parseInt(eg.value.trim(),10);
 
-  const r=await fetch(API+"/containers",{method:"POST",headers:{"Content-Type":"application/json",...h()},body:JSON.stringify(body)});
-  const j=await r.json();
+  const r = await fetchWithTimeout(API + "/containers", {
+    method:"POST",
+    headers:{"Content-Type":"application/json",...h()},
+    body: JSON.stringify(body)
+  }, 30000);
+
+  const j = await r.json().catch(()=>({}));
   if(!r.ok){ msg("createMsg", j.detail||"创建失败"); return; }
   msg("createMsg","创建成功 ✅");
   await refreshContainers();
@@ -629,30 +751,43 @@ async function execCmdGo(){
   const cmdLine=execCmd.value.trim();
   if(!nid||!name||!cmdLine){ alert("节点、短名、命令都要填"); return; }
   execOut.innerText="执行中...";
-  const r=await fetch(API+"/containers/exec",{method:"POST",headers:{"Content-Type":"application/json",...h()},
-    body:JSON.stringify({node_id:nid,name,cmd:cmdLine.split(" ").filter(Boolean)})});
-  const j=await r.json();
+
+  const r = await fetchWithTimeout(API + "/containers/exec", {
+    method:"POST",
+    headers:{"Content-Type":"application/json",...h()},
+    body: JSON.stringify({node_id:nid,name,cmd:cmdLine.split(" ").filter(Boolean)})
+  }, 20000);
+
+  const j = await r.json().catch(()=>({}));
   if(!r.ok){ execOut.innerText=j.detail||"执行失败"; return; }
   execOut.innerText=j.output||"";
 }
 
+probeAPI();
 if(token) boot();
 </script>
 </body>
 </html>
-HTML_EOF
+HTML
 
-echo -e "${GREEN}[5/7] 安装 Python 环境 & 依赖...${NC}"
+# Inject BASE_PATH into frontend
+say "注入访问路径 BASE_PATH 到前端..."
+sed -i "s|__BASE_PATH__|${BASE_PATH}|g" "${APP_DIR}/index.html"
+
+say "创建 venv 并安装依赖..."
 python3 -m venv "${PY_VENV}"
 "${PY_VENV}/bin/pip" install --upgrade pip >/dev/null
-"${PY_VENV}/bin/pip" install -r "${BACKEND_DIR}/requirements.txt" >/dev/null
+"${PY_VENV}/bin/pip" install \
+  fastapi==0.115.0 \
+  uvicorn[standard]==0.30.6 \
+  python-jose==3.3.0 \
+  passlib[bcrypt]==1.7.4 \
+  pydantic==2.8.2 \
+  httpx==0.27.2 >/dev/null
 
-echo -e "${GREEN}[6/7] 配置 Systemd & Nginx...${NC}"
+say "写入 systemd 服务..."
+JWT_SECRET="$(openssl rand -hex 32)"
 
-# 生成 JWT Secret
-JWT_SECRET=$(openssl rand -hex 32)
-
-# Systemd Service
 cat > /etc/systemd/system/lxd-panel.service <<EOF
 [Unit]
 Description=LXD Panel Backend
@@ -660,11 +795,13 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${BACKEND_DIR}
+WorkingDirectory=${APP_DIR}
 Environment="LXD_PANEL_DB=${DATA_DIR}/panel.db"
 Environment="LXD_PANEL_CERT_CACHE=${CERT_CACHE}"
 Environment="LXD_PANEL_JWT_SECRET=${JWT_SECRET}"
-ExecStart=${PY_VENV}/bin/uvicorn app:app --host 127.0.0.1 --port ${API_PORT}
+Environment="LXD_PANEL_ADMIN_USER=${ADMIN_USER}"
+Environment="LXD_PANEL_ADMIN_PASS=${ADMIN_PASS}"
+ExecStart=${PY_VENV}/bin/uvicorn app:app --host 127.0.0.1 --port ${BACKEND_PORT}
 Restart=always
 RestartSec=2
 StandardOutput=append:${LOG_DIR}/panel.log
@@ -677,13 +814,17 @@ EOF
 systemctl daemon-reload
 systemctl enable --now lxd-panel.service
 
-# Nginx Config
-cat > /etc/nginx/sites-available/lxd-panel <<EOF
-server {
-  listen 80 default_server;
-  listen [::]:80 default_server;
+say "配置 Nginx（支持路径前缀 ${BASE_PATH}）..."
+NGINX_SITE="/etc/nginx/sites-available/lxd-panel"
 
-  root ${FRONTEND_DIR};
+if [[ "${BASE_PATH}" == "/" ]]; then
+  cat > "${NGINX_SITE}" <<EOF
+server {
+  listen ${PANEL_PORT} default_server;
+  listen [::]:${PANEL_PORT} default_server;
+  server_name ${DOMAIN};
+
+  root ${APP_DIR};
   index index.html;
 
   location / {
@@ -691,7 +832,7 @@ server {
   }
 
   location /api/ {
-    proxy_pass http://127.0.0.1:${API_PORT}/api/;
+    proxy_pass http://127.0.0.1:${BACKEND_PORT}/api/;
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
@@ -699,22 +840,65 @@ server {
   }
 }
 EOF
+else
+  cat > "${NGINX_SITE}" <<EOF
+server {
+  listen ${PANEL_PORT} default_server;
+  listen [::]:${PANEL_PORT} default_server;
+  server_name ${DOMAIN};
+
+  location ${BASE_PATH}/ {
+    alias ${APP_DIR}/;
+    try_files \$uri \$uri/ ${BASE_PATH}/index.html;
+  }
+
+  location ${BASE_PATH}/api/ {
+    proxy_pass http://127.0.0.1:${BACKEND_PORT}/api/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  }
+}
+EOF
+fi
 
 rm -f /etc/nginx/sites-enabled/default || true
 ln -sf /etc/nginx/sites-available/lxd-panel /etc/nginx/sites-enabled/lxd-panel
-nginx -t >/dev/null 2>&1
+nginx -t
 systemctl enable --now nginx
 systemctl restart nginx
 
-# 获取本机 IP
-HOST_IP=$(hostname -I | awk '{print $1}')
+if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
+  say "申请 Let’s Encrypt 证书（要求域名已解析到本机，且公网可访问）..."
+  certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" || {
+    err "证书申请失败：检查域名解析/端口/防火墙。可先选 n 用 http 跑起来。"
+    exit 1
+  }
+fi
 
-echo -e "${GREEN}[7/7] 部署完成！${NC}"
+say "健康检查（后端本地）..."
+set +e
+curl -fsS "http://127.0.0.1:${BACKEND_PORT}/api/health" >/dev/null
+HC=$?
+set -e
+if [[ $HC -ne 0 ]]; then
+  warn "后端健康检查失败：journalctl -u lxd-panel -n 200 --no-pager"
+else
+  say "后端健康检查 OK"
+fi
+
 echo "------------------------------------------------------------"
-echo "✅ LXD Panel 已启动"
-echo "访问地址： http://${HOST_IP}/"
-echo "默认账号： admin"
-echo "默认密码： ChangeMeNow!"
+echo "✅ Panel 部署完成"
+if [[ "${TLS_MODE}" == "letsencrypt" ]]; then
+  echo "访问： https://${DOMAIN}${BASE_PATH}/"
+else
+  echo "访问： http://<面板服务器IP>:${PANEL_PORT}${BASE_PATH}/"
+fi
+echo "Admin：${ADMIN_USER}"
+echo "Password：${ADMIN_PASS}"
 echo ""
-echo "👉 请立即登录并修改密码！"
+echo "排障命令："
+echo "  - 后端日志：journalctl -u lxd-panel -n 200 --no-pager"
+echo "  - Nginx 配置：nginx -T | sed -n '1,200p'"
 echo "------------------------------------------------------------"
