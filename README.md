@@ -27,11 +27,11 @@
 
 ```mermaid
 graph LR
-    User[管理员/用户] -->|HTTPS| Panel[LXD Panel (本控制台)]
-    Panel -->|mTLS 加密通道| Node1[宿主机 A (Agent)]
-    Panel -->|mTLS 加密通道| Node2[宿主机 B (Agent)]
-    Panel -->|mTLS 加密通道| Node3[宿主机 C (Agent)]
+    User["管理员/用户"] -->|HTTPS| Panel["LXD Panel (本控制台)"]
+    Panel -->|mTLS 加密通道| Node1["宿主机 A (Agent)"]
+    Panel -->|mTLS 加密通道| Node2["宿主机 B (Agent)"]
+    Panel -->|mTLS 加密通道| Node3["宿主机 C (Agent)"]
     
     subgraph "安全层 (Security)"
-    Node1 --- Cert[客户端证书校验]
+    Node1 --- Cert["客户端证书校验"]
     end
