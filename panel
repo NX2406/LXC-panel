@@ -1,870 +1,1011 @@
 #!/bin/bash
-# ==============================================================================
-# 项目: LXD Hub (Go 单体版) - 一键安装脚本
-# 功能:
-# - 安装/初始化 LXD (snap)
-# - 生成 mTLS 证书 (CA/Server/Client)
-# - 编译并部署 Go 服务 (一个进程=Agent+Proxy+Panel)
-# - :443  mTLS API
-# - :18080 面板+API (Header Token 鉴权)
-#
-# 运行环境: Debian 11+ / Ubuntu 20.04+ (Root)
-# ==============================================================================
-
 set -euo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
-PLAIN='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;36m'; PLAIN='\033[0m'
+info(){ echo -e "${BLUE}[INFO]${PLAIN} $*"; }
+ok(){ echo -e "${GREEN}[OK]${PLAIN} $*"; }
+warn(){ echo -e "${YELLOW}[WARN]${PLAIN} $*"; }
+die(){ echo -e "${RED}[ERR]${PLAIN} $*"; exit 1; }
 
-log() { echo -e "${BLUE}[*]${PLAIN} $*"; }
-ok()  { echo -e "${GREEN}[OK]${PLAIN} $*"; }
-warn(){ echo -e "${YELLOW}[!]${PLAIN} $*"; }
-die() { echo -e "${RED}[X]${PLAIN} $*"; exit 1; }
+[[ $EUID -eq 0 ]] || die "请用 root 运行"
 
-[[ $EUID -ne 0 ]] && die "请使用 root 权限运行"
+export DEBIAN_FRONTEND=noninteractive
 
-APP_DIR="/opt/lxd-hub"
-BIN_PATH="${APP_DIR}/lxd-hub"
-CERT_DIR="${APP_DIR}/certs"
-DATA_DIR="${APP_DIR}/data"
-PANEL_DIR="${APP_DIR}/panel"
+APP_DIR="/opt/lxd-webpanel"
+CFG_DIR="/etc/lxd-webpanel"
+DATA_DIR="/var/lib/lxd-webpanel"
+SERVICE_NAME="lxd-webpanel"
+PORT="${PORT:-8088}"
 
-MTLS_PORT="443"
-PANEL_PORT="18080"
+rand_hex(){ tr -dc 'a-f0-9' </dev/urandom | head -c "${1:-16}"; }
+rand_pw(){ tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c "${1:-18}"; }
 
-# ------------------------------------------------------------------------------
-# 1) 安装依赖
-# ------------------------------------------------------------------------------
+host_ip() {
+  local ip
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [[ -z "${ip}" ]] && ip="127.0.0.1"
+  echo "$ip"
+}
+
+install_node() {
+  if command -v node >/dev/null 2>&1; then
+    ok "Node 已存在：$(node -v)"
+    return
+  fi
+  info "安装 Node.js（Debian/Ubuntu 官方源可能较旧，先尝试 apt）..."
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg
+  # NodeSource 18.x（稳）
+  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+  apt-get install -y nodejs
+  ok "Node 已安装：$(node -v)"
+}
+
 install_deps() {
-  echo -e "${YELLOW}[1/6] 安装依赖...${PLAIN}"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq curl jq openssl ufw ca-certificates >/dev/null
-
-  # snapd
-  if ! command -v snap >/dev/null 2>&1; then
-    log "安装 snapd..."
-    apt-get install -y -qq snapd >/dev/null
-    systemctl enable --now snapd >/dev/null 2>&1 || true
-  fi
-
-  # Go（编译用）
-  if ! command -v go >/dev/null 2>&1; then
-    log "安装 golang（用于编译）..."
-    apt-get install -y -qq golang >/dev/null
-  fi
-
-  ok "依赖就绪"
+  info "安装系统依赖..."
+  apt-get update -y
+  apt-get install -y git build-essential python3 make g++ sqlite3
+  ok "系统依赖安装完成"
 }
 
-# ------------------------------------------------------------------------------
-# 2) 安装/初始化 LXD
-# ------------------------------------------------------------------------------
-install_lxd() {
-  echo -e "${YELLOW}[2/6] 安装/初始化 LXD...${PLAIN}"
-  if ! command -v lxc >/dev/null 2>&1; then
-    log "snap install lxd"
-    snap install lxd >/dev/null
-    log "lxd init --auto"
-    lxd init --auto >/dev/null
-  else
-    ok "LXD 已存在"
-  fi
+write_app_files() {
+  info "写入应用文件..."
+  mkdir -p "$APP_DIR" "$CFG_DIR" "$DATA_DIR"
+
+  cat > "${APP_DIR}/package.json" << 'JSON'
+{
+  "name": "lxd-webpanel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "csurf": "^1.11.0",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.1",
+    "express-session": "^1.17.3",
+    "sqlite3": "^5.1.7"
+  }
+}
+JSON
+
+  cat > "${APP_DIR}/server.js" << 'JS'
+import express from "express";
+import session from "express-session";
+import rateLimit from "express-rate-limit";
+import cookieParser from "cookie-parser";
+import csrf from "csurf";
+import bcrypt from "bcryptjs";
+import sqlite3 from "sqlite3";
+import { promisify } from "util";
+import fs from "fs";
+import path from "path";
+import os from "os";
+
+const CFG_PATH = process.env.CFG_PATH || "/etc/lxd-webpanel/config.json";
+const DATA_DIR = process.env.DATA_DIR || "/var/lib/lxd-webpanel";
+const DB_PATH = path.join(DATA_DIR, "webpanel.db");
+
+function die(msg){ console.error(msg); process.exit(1); }
+if(!fs.existsSync(CFG_PATH)) die("Missing config: " + CFG_PATH);
+
+const cfg = JSON.parse(fs.readFileSync(CFG_PATH, "utf-8"));
+const ENTRY = (cfg.entry_path || "/panel").replace(/\/+$/,"");
+const PANEL_URL = (cfg.panel_url || "").replace(/\/+$/,"");
+const PANEL_ADMIN_USER = cfg.panel_admin_user || "admin";
+const PANEL_ADMIN_PASS = cfg.panel_admin_pass || "";
+const PORT = Number(cfg.listen_port || 8088);
+
+if(!PANEL_URL) die("config.panel_url is empty");
+if(!PANEL_ADMIN_PASS) die("config.panel_admin_pass is empty");
+
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+app.use(express.urlencoded({ extended: false, limit:"1mb" }));
+app.use(express.json({ limit:"1mb" }));
+app.use(cookieParser());
+
+app.use(rateLimit({
+  windowMs: 60_000,
+  limit: 180,
+  standardHeaders: "draft-7",
+  legacyHeaders: false
+}));
+
+app.use(session({
+  secret: cfg.session_secret || "change-me",
+  resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly:true, sameSite:"lax", secure:false, maxAge: 7*24*3600*1000 }
+}));
+
+const csrfProtection = csrf({ cookie: false });
+
+/** ---------------- DB ---------------- */
+sqlite3.verbose();
+const db = new sqlite3.Database(DB_PATH);
+const run = (sql, params=[]) => new Promise((res, rej)=>db.run(sql, params, function(err){ err?rej(err):res(this); }));
+const get = (sql, params=[]) => new Promise((res, rej)=>db.get(sql, params, (err,row)=>err?rej(err):res(row)));
+const all = (sql, params=[]) => new Promise((res, rej)=>db.all(sql, params, (err,rows)=>err?rej(err):res(rows)));
+
+async function initDb(){
+  await run(`CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    passhash TEXT NOT NULL,
+    role TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+  )`);
+  await run(`CREATE TABLE IF NOT EXISTS assignments(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    instance_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, node_id, instance_name)
+  )`);
+  await run(`CREATE TABLE IF NOT EXISTS audit(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL
+  )`);
+
+  // ensure admin
+  const adminUser = cfg.admin_user || "admin";
+  const adminPass = cfg.admin_pass || "";
+  if(!adminPass) die("config.admin_pass empty");
+  const row = await get("SELECT id FROM users WHERE username=?", [adminUser]);
+  if(!row){
+    const passhash = bcrypt.hashSync(adminPass, 10);
+    await run("INSERT INTO users(username, passhash, role, enabled, created_at) VALUES(?,?,?,?,?)",
+      [adminUser, passhash, "admin", 1, new Date().toISOString()]);
+    await audit("system","admin.bootstrap", JSON.stringify({adminUser}));
+  }
 }
 
-# ------------------------------------------------------------------------------
-# 3) 生成证书 + 面板 Token
-# ------------------------------------------------------------------------------
-generate_secrets() {
-  echo -e "${YELLOW}[3/6] 生成证书与鉴权信息...${PLAIN}"
-  mkdir -p "${CERT_DIR}" "${DATA_DIR}" "${PANEL_DIR}"
-
-  HOST_IP="$(hostname -I | awk '{print $1}')"
-  [[ -z "${HOST_IP}" ]] && HOST_IP="127.0.0.1"
-
-  # 面板 Token（用于 18080 的 Header 鉴权）
-  if [[ ! -f "${DATA_DIR}/panel.token" ]]; then
-    openssl rand -hex 16 > "${DATA_DIR}/panel.token"
-  fi
-
-  # mTLS CA
-  if [[ ! -f "${CERT_DIR}/ca.crt" ]]; then
-    openssl genrsa -out "${CERT_DIR}/ca.key" 4096 2>/dev/null
-    openssl req -x509 -new -nodes -key "${CERT_DIR}/ca.key" -days 3650 \
-      -subj "/CN=LXD-Hub-CA" -out "${CERT_DIR}/ca.crt" 2>/dev/null
-  fi
-
-  # Server cert（mTLS 服务端）
-  if [[ ! -f "${CERT_DIR}/server.crt" ]]; then
-    openssl genrsa -out "${CERT_DIR}/server.key" 2048 2>/dev/null
-    cat > "${CERT_DIR}/server.cnf" <<EOF
-[req]
-default_bits = 2048
-prompt = no
-default_md = sha256
-distinguished_name = dn
-req_extensions = req_ext
-[dn]
-CN = ${HOST_IP}
-[req_ext]
-subjectAltName = IP:${HOST_IP}
-EOF
-    openssl req -new -key "${CERT_DIR}/server.key" -config "${CERT_DIR}/server.cnf" \
-      -out "${CERT_DIR}/server.csr" 2>/dev/null
-    openssl x509 -req -in "${CERT_DIR}/server.csr" \
-      -CA "${CERT_DIR}/ca.crt" -CAkey "${CERT_DIR}/ca.key" -CAcreateserial \
-      -out "${CERT_DIR}/server.crt" -days 3650 \
-      -extensions req_ext -extfile "${CERT_DIR}/server.cnf" 2>/dev/null
-  fi
-
-  # Client cert（外部调用 443 mTLS API 用）
-  if [[ ! -f "${CERT_DIR}/client.crt" ]]; then
-    openssl genrsa -out "${CERT_DIR}/client.key" 2048 2>/dev/null
-    openssl req -new -key "${CERT_DIR}/client.key" -subj "/CN=LXD-Hub-Client" \
-      -out "${CERT_DIR}/client.csr" 2>/dev/null
-    openssl x509 -req -in "${CERT_DIR}/client.csr" \
-      -CA "${CERT_DIR}/ca.crt" -CAkey "${CERT_DIR}/ca.key" -CAcreateserial \
-      -out "${CERT_DIR}/client.crt" -days 3650 2>/dev/null
-  fi
-
-  chmod 644 "${CERT_DIR}"/*.crt
-  chmod 600 "${CERT_DIR}"/*.key
-  ok "证书与 Token 已生成"
+async function audit(actor, action, detail){
+  await run("INSERT INTO audit(ts,actor,action,detail) VALUES(?,?,?,?)",
+    [new Date().toISOString(), actor, action, detail]);
 }
 
-# ------------------------------------------------------------------------------
-# 4) 写 Go 源码 + 编译
-# ------------------------------------------------------------------------------
-build_go() {
-  echo -e "${YELLOW}[4/6] 编译 Go 服务...${PLAIN}"
-  mkdir -p "${APP_DIR}"
-  cat > "${APP_DIR}/main.go" <<'EOF'
-package main
+/** ---------------- Panel JWT cache ---------------- */
+let panelJwt = "";
+let panelJwtAt = 0;
 
-import (
-	"bytes"
-	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"io"
-	"log"
-	"net"
-	"net/http"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strconv"
-	"strings"
-	"time"
-)
+async function panelLogin(){
+  const now = Date.now();
+  // 15分钟内复用
+  if(panelJwt && (now - panelJwtAt) < 15*60*1000) return panelJwt;
 
-type ContainerReq struct {
-	Name    string `json:"name"`
-	Image   string `json:"image"`
-	CPU     int    `json:"cpu"`
-	Memory  int    `json:"memory"` // MB
-	Disk    int    `json:"disk"`   // GB
-	Ports   string `json:"ports"`  // "10001:22,10002:80"
-	Ingress *int   `json:"ingress"`
-	Egress  *int   `json:"egress"`
+  const r = await fetch(PANEL_URL + "/auth/login", {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ username: PANEL_ADMIN_USER, password: PANEL_ADMIN_PASS })
+  });
+  const txt = await r.text();
+  let j = null; try{ j = txt?JSON.parse(txt):null; }catch{}
+  if(!r.ok) throw new Error(j?.detail || j?.message || txt || ("Panel login failed: "+r.status));
+  if(!j?.token) throw new Error("Panel login response missing token");
+  panelJwt = j.token;
+  panelJwtAt = now;
+  return panelJwt;
 }
 
-type Config struct {
-	AppDir     string
-	CertDir    string
-	DataDir    string
-	PanelDir   string
-	MtlsPort   int
-	PanelPort  int
-	PanelToken string
+async function panelFetch(method, path, body){
+  const token = await panelLogin();
+  const url = PANEL_URL + path;
+  const headers = { "Authorization": "Bearer " + token };
+  if(body !== undefined) headers["Content-Type"] = "application/json";
+
+  const r = await fetch(url, { method, headers, body: body===undefined? undefined : JSON.stringify(body) });
+  const txt = await r.text();
+  let j = null; try{ j = txt?JSON.parse(txt):null; }catch{}
+  if(!r.ok) throw new Error(j?.detail || j?.message || txt || ("Panel request failed: "+r.status));
+  return j ?? txt;
 }
 
-func mustReadFile(path string) []byte {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		log.Fatalf("read file failed: %s: %v", path, err)
-	}
-	return b
+/** ---------------- Auth middleware ---------------- */
+function mustLogin(req,res,next){
+  if(!req.session.user) return res.redirect(ENTRY + "/login");
+  next();
+}
+function mustAdmin(req,res,next){
+  if(!req.session.user || req.session.user.role!=="admin") return res.status(403).send("Forbidden");
+  next();
+}
+function mustUser(req,res,next){
+  if(!req.session.user || (req.session.user.role!=="user" && req.session.user.role!=="admin")) return res.status(403).send("Forbidden");
+  next();
 }
 
-func readToken(path string) string {
-	b := mustReadFile(path)
-	return strings.TrimSpace(string(b))
-}
+/** ---------------- HTML helpers ---------------- */
+function esc(s){ return String(s||"").replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
-}
-
-func bad(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]any{"error": msg})
-}
-
-func runCapture(timeout time.Duration, name string, args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, name, args...)
-	var out bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("command timeout: %s %v", name, args)
-	}
-	if err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = strings.TrimSpace(out.String())
-		}
-		if msg == "" {
-			msg = err.Error()
-		}
-		return "", fmt.Errorf("command failed: %s %v: %s", name, args, msg)
-	}
-	return out.String(), nil
-}
-
-func runOK(timeout time.Duration, name string, args ...string) error {
-	_, err := runCapture(timeout, name, args...)
-	return err
-}
-
-func validateReq(r *ContainerReq) error {
-	if strings.TrimSpace(r.Name) == "" {
-		return errors.New("name required")
-	}
-	if r.Image == "" {
-		r.Image = "images:debian/11"
-	}
-	if r.CPU <= 0 || r.CPU > 128 {
-		return errors.New("cpu must be 1..128")
-	}
-	if r.Memory < 128 || r.Memory > 1048576 {
-		return errors.New("memory(MB) must be 128..1048576")
-	}
-	if r.Disk < 1 || r.Disk > 1048576 {
-		return errors.New("disk(GB) must be 1..1048576")
-	}
-	if r.Ingress != nil && (*r.Ingress < 1 || *r.Ingress > 100000) {
-		return errors.New("ingress Mbps must be 1..100000")
-	}
-	if r.Egress != nil && (*r.Egress < 1 || *r.Egress > 100000) {
-		return errors.New("egress Mbps must be 1..100000")
-	}
-	return nil
-}
-
-func apiList(w http.ResponseWriter, _ *http.Request) {
-	out, err := runCapture(20*time.Second, "lxc", "list", "--format", "json")
-	if err != nil {
-		bad(w, 500, err.Error())
-		return
-	}
-	var v any
-	if err := json.Unmarshal([]byte(out), &v); err != nil {
-		bad(w, 500, "failed to parse lxc list output")
-		return
-	}
-	writeJSON(w, 200, v)
-}
-
-func apiCreate(w http.ResponseWriter, req *http.Request) {
-	body, _ := io.ReadAll(io.LimitReader(req.Body, 2<<20))
-	var c ContainerReq
-	if err := json.Unmarshal(body, &c); err != nil {
-		bad(w, 400, "invalid json")
-		return
-	}
-	if c.Image == "" {
-		c.Image = "images:debian/11"
-	}
-	if c.CPU == 0 {
-		c.CPU = 1
-	}
-	if c.Memory == 0 {
-		c.Memory = 512
-	}
-	if c.Disk == 0 {
-		c.Disk = 5
-	}
-	if err := validateReq(&c); err != nil {
-		bad(w, 400, err.Error())
-		return
-	}
-
-	// 1) launch
-	if err := runOK(180*time.Second, "lxc", "launch", c.Image, c.Name); err != nil {
-		bad(w, 500, err.Error())
-		return
-	}
-
-	// 2) limits
-	_ = runOK(15*time.Second, "lxc", "config", "set", c.Name, "limits.cpu", strconv.Itoa(c.CPU))
-	_ = runOK(15*time.Second, "lxc", "config", "set", c.Name, "limits.memory", fmt.Sprintf("%dMB", c.Memory))
-
-	// 3) disk
-	if err := runOK(15*time.Second, "lxc", "config", "device", "set", c.Name, "root", "size", fmt.Sprintf("%dGB", c.Disk)); err != nil {
-		_ = runOK(15*time.Second, "lxc", "config", "device", "override", c.Name, "root", fmt.Sprintf("size=%dGB", c.Disk))
-	}
-
-	// 4) net limits (eth0)
-	if c.Ingress != nil {
-		_ = runOK(15*time.Second, "lxc", "config", "device", "override", c.Name, "eth0", fmt.Sprintf("limits.ingress=%dMbit", *c.Ingress))
-	}
-	if c.Egress != nil {
-		_ = runOK(15*time.Second, "lxc", "config", "device", "override", c.Name, "eth0", fmt.Sprintf("limits.egress=%dMbit", *c.Egress))
-	}
-
-	// 5) ports proxy device
-	if strings.TrimSpace(c.Ports) != "" {
-		maps := strings.Split(c.Ports, ",")
-		idx := 0
-		for _, m := range maps {
-			m = strings.TrimSpace(m)
-			if m == "" || !strings.Contains(m, ":") {
-				continue
-			}
-			parts := strings.SplitN(m, ":", 2)
-			pub := strings.TrimSpace(parts[0])
-			priv := strings.TrimSpace(parts[1])
-			if pub == "" || priv == "" {
-				continue
-			}
-			if _, err := strconv.Atoi(pub); err != nil {
-				continue
-			}
-			if _, err := strconv.Atoi(priv); err != nil {
-				continue
-			}
-			devName := fmt.Sprintf("proxy%d", idx)
-			// connect 到容器 127.0.0.1:priv（与你原逻辑一致）
-			_ = runOK(15*time.Second, "lxc", "config", "device", "add", c.Name, devName, "proxy",
-				fmt.Sprintf("listen=tcp:0.0.0.0:%s", pub),
-				fmt.Sprintf("connect=tcp:127.0.0.1:%s", priv),
-			)
-			idx++
-		}
-	}
-
-	writeJSON(w, 200, map[string]any{"status": "created", "name": c.Name})
-}
-
-func apiDelete(w http.ResponseWriter, name string) {
-	if strings.TrimSpace(name) == "" {
-		bad(w, 400, "name required")
-		return
-	}
-	if err := runOK(60*time.Second, "lxc", "delete", name, "--force"); err != nil {
-		bad(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"status": "deleted", "name": name})
-}
-
-func apiAction(w http.ResponseWriter, name, action string) {
-	action = strings.ToLower(strings.TrimSpace(action))
-	if action != "start" && action != "stop" && action != "restart" {
-		bad(w, 400, "invalid action")
-		return
-	}
-	if strings.TrimSpace(name) == "" {
-		bad(w, 400, "name required")
-		return
-	}
-	if err := runOK(60*time.Second, "lxc", action, name); err != nil {
-		bad(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"status": "ok", "name": name, "action": action})
-}
-
-func withPanelToken(token string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 面板与面板 API 统一用 Header Token
-		if r.URL.Path == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		got := r.Header.Get("X-Panel-Token")
-		if got != token {
-			bad(w, 401, "missing/invalid X-Panel-Token")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func router(cfg Config) http.Handler {
-	mux := http.NewServeMux()
-
-	// health
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, 200, map[string]any{"ok": true})
-	})
-
-	// Panel static（简单起见：面板 HTML 文件）
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// 只提供面板文件
-		if r.URL.Path != "/" && r.URL.Path != "/panel.html" {
-			http.NotFound(w, r)
-			return
-		}
-		p := filepath.Join(cfg.PanelDir, "panel.html")
-		b, err := os.ReadFile(p)
-		if err != nil {
-			bad(w, 500, "panel not found")
-			return
-		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write(b)
-	})
-
-	// API
-	mux.HandleFunc("/api/list", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			bad(w, 405, "method not allowed")
-			return
-		}
-		apiList(w, r)
-	})
-
-	mux.HandleFunc("/api/create", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			bad(w, 405, "method not allowed")
-			return
-		}
-		apiCreate(w, r)
-	})
-
-	mux.HandleFunc("/api/delete/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			bad(w, 405, "method not allowed")
-			return
-		}
-		name := strings.TrimPrefix(r.URL.Path, "/api/delete/")
-		apiDelete(w, name)
-	})
-
-	mux.HandleFunc("/api/action/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			bad(w, 405, "method not allowed")
-			return
-		}
-		rest := strings.TrimPrefix(r.URL.Path, "/api/action/")
-		parts := strings.Split(rest, "/")
-		if len(parts) != 2 {
-			bad(w, 400, "path must be /api/action/{name}/{action}")
-			return
-		}
-		apiAction(w, parts[0], parts[1])
-	})
-
-	return mux
-}
-
-func loadTLSConfig(certDir string) (*tls.Config, error) {
-	caPEM, err := os.ReadFile(filepath.Join(certDir, "ca.crt"))
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, "server.crt"), filepath.Join(certDir, "server.key"))
-	if err != nil {
-		return nil, err
-	}
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caPEM) {
-		return nil, errors.New("failed to append ca")
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    caPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS12,
-	}, nil
-}
-
-func localIP() string {
-	ifaces, _ := net.Interfaces()
-	for _, iface := range ifaces {
-		addrs, _ := iface.Addrs()
-		for _, a := range addrs {
-			ipnet, ok := a.(*net.IPNet)
-			if !ok || ipnet.IP == nil {
-				continue
-			}
-			ip := ipnet.IP.To4()
-			if ip == nil {
-				continue
-			}
-			s := ip.String()
-			if s != "127.0.0.1" {
-				return s
-			}
-		}
-	}
-	return "127.0.0.1"
-}
-
-func main() {
-	cfg := Config{
-		AppDir:    "/opt/lxd-hub",
-		CertDir:   "/opt/lxd-hub/certs",
-		DataDir:   "/opt/lxd-hub/data",
-		PanelDir:  "/opt/lxd-hub/panel",
-		MtlsPort:  443,
-		PanelPort: 18080,
-	}
-
-	// env override（可选）
-	if v := os.Getenv("MTLS_PORT"); v != "" {
-		if p, _ := strconv.Atoi(v); p > 0 {
-			cfg.MtlsPort = p
-		}
-	}
-	if v := os.Getenv("PANEL_PORT"); v != "" {
-		if p, _ := strconv.Atoi(v); p > 0 {
-			cfg.PanelPort = p
-		}
-	}
-	cfg.PanelToken = readToken(filepath.Join(cfg.DataDir, "panel.token"))
-
-	// Router
-	base := router(cfg)
-
-	// Panel server（需要 Token）
-	panelSrv := &http.Server{
-		Addr:              fmt.Sprintf("0.0.0.0:%d", cfg.PanelPort),
-		Handler:           withPanelToken(cfg.PanelToken, base),
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	// mTLS server（强认证，不需要 PanelToken）
-	mtlsTLS, err := loadTLSConfig(cfg.CertDir)
-	if err != nil {
-		log.Fatalf("tls config error: %v", err)
-	}
-	mtlsSrv := &http.Server{
-		Addr:              fmt.Sprintf("0.0.0.0:%d", cfg.MtlsPort),
-		Handler:           base,
-		TLSConfig:         mtlsTLS,
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-
-	// 启动
-	go func() {
-		log.Printf("Panel+API: http://0.0.0.0:%d (requires X-Panel-Token)", cfg.PanelPort)
-		if err := panelSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("panel server error: %v", err)
-		}
-	}()
-
-	log.Printf("mTLS API: https://0.0.0.0:%d (client cert required)", cfg.MtlsPort)
-	ln, err := net.Listen("tcp", mtlsSrv.Addr)
-	if err != nil {
-		log.Fatalf("listen mtls error: %v", err)
-	}
-	tlsLn := tls.NewListener(ln, mtlsTLS)
-	if err := mtlsSrv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("mtls server error: %v", err)
-	}
-
-	_ = localIP()
-}
-EOF
-
-  # 写前端 panel.html（保持“静态+零构建”）
-  cat > "${PANEL_DIR}/panel.html" <<'EOF'
-<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>LXD Hub Panel</title>
-  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-  <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-slate-950 text-slate-100">
-<div id="app" class="max-w-6xl mx-auto p-6 space-y-6">
-  <header class="flex items-center justify-between">
-    <div>
-      <h1 class="text-2xl font-semibold">LXD Hub 管理面板</h1>
-      <p class="text-slate-400 text-sm">Go 单体服务：一个进程把事情干漂亮。🧩</p>
-    </div>
-    <div class="flex items-center gap-2">
-      <input v-model="base" class="w-72 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700"
-             placeholder="例如 http://1.2.3.4:18080" />
-      <input v-model="token" class="w-72 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700"
-             placeholder="X-Panel-Token（安装脚本会输出）" />
-      <button @click="refresh" class="px-4 py-2 rounded-xl bg-slate-100 text-slate-900 font-semibold">刷新</button>
-    </div>
-  </header>
-
-  <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-    <div class="lg:col-span-1 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-      <h2 class="text-lg font-semibold mb-4">创建容器</h2>
-      <div class="space-y-3">
-        <div>
-          <label class="text-sm text-slate-300">名称</label>
-          <input v-model="form.name" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="demo-01"/>
-        </div>
-        <div>
-          <label class="text-sm text-slate-300">镜像</label>
-          <input v-model="form.image" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="images:debian/11"/>
-        </div>
-        <div class="grid grid-cols-3 gap-2">
-          <div><label class="text-sm text-slate-300">CPU</label>
-            <input v-model.number="form.cpu" type="number" min="1" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/></div>
-          <div><label class="text-sm text-slate-300">内存(MB)</label>
-            <input v-model.number="form.memory" type="number" min="128" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/></div>
-          <div><label class="text-sm text-slate-300">磁盘(GB)</label>
-            <input v-model.number="form.disk" type="number" min="1" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800"/></div>
-        </div>
-        <div class="grid grid-cols-2 gap-2">
-          <div><label class="text-sm text-slate-300">入站(Mbps)</label>
-            <input v-model.number="form.ingress" type="number" min="0" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="可空"/></div>
-          <div><label class="text-sm text-slate-300">出站(Mbps)</label>
-            <input v-model.number="form.egress" type="number" min="0" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="可空"/></div>
-        </div>
-        <div>
-          <label class="text-sm text-slate-300">端口映射</label>
-          <input v-model="form.ports" class="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="10001:22,10002:80 可空"/>
-        </div>
-        <button @click="create" class="w-full px-4 py-2 rounded-xl bg-emerald-400 text-slate-900 font-semibold">创建</button>
-        <p v-if="notice" class="text-sm text-slate-300"><span class="text-slate-400">提示：</span>{{notice}}</p>
-      </div>
-    </div>
-
-    <div class="lg:col-span-2 rounded-2xl border border-slate-800 bg-slate-900/40 p-5">
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-lg font-semibold">容器列表</h2>
-        <div class="flex items-center gap-2">
-          <input v-model="filter" class="px-3 py-2 rounded-xl bg-slate-950 border border-slate-800" placeholder="搜索名称..."/>
-          <span class="text-sm text-slate-400">共 {{ filtered.length }} 个</span>
-        </div>
-      </div>
-
-      <div v-if="loading" class="text-slate-400">加载中...</div>
-      <div v-else class="space-y-3">
-        <div v-for="c in filtered" :key="c.name"
-             class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4 flex items-center justify-between gap-4">
-          <div class="min-w-0">
-            <div class="flex items-center gap-2">
-              <div class="font-semibold truncate">{{ c.name }}</div>
-              <span class="text-xs px-2 py-1 rounded-full"
-                    :class="c.status==='Running' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                                                 : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'">
-                {{ c.status }}
-              </span>
-            </div>
-            <div class="text-sm text-slate-400 mt-1 truncate">IPv4: {{ c.ipv4 || '-' }} · Image: {{ c.image || '-' }}</div>
-          </div>
-
-          <div class="flex items-center gap-2 shrink-0">
-            <button @click="act(c.name,'start')" class="px-3 py-2 rounded-xl bg-slate-100 text-slate-900 font-semibold">Start</button>
-            <button @click="act(c.name,'stop')" class="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 border border-slate-700">Stop</button>
-            <button @click="act(c.name,'restart')" class="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 border border-slate-700">Restart</button>
-            <button @click="del(c.name)" class="px-3 py-2 rounded-xl bg-rose-500/90 text-white font-semibold">Delete</button>
-          </div>
-        </div>
-
-        <div v-if="!filtered.length" class="text-slate-400">没有匹配的容器。</div>
-      </div>
-
-      <div v-if="error" class="mt-4 rounded-xl border border-rose-800 bg-rose-950/40 p-3 text-rose-200 text-sm">{{ error }}</div>
-    </div>
-  </section>
-
-  <footer class="text-xs text-slate-500">
-    面板通过 Header: X-Panel-Token 鉴权；443 端口为 mTLS 强认证 API（给外部程序用）。
-  </footer>
+function layout(title, user, body){
+  const u = user ? `${esc(user.username)} (${esc(user.role)})` : "未登录";
+  return `<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${esc(title)}</title>
+<style>
+:root{--bg:#0b1220;--panel:#0f1a33;--card:#111f3f;--muted:#9fb2d0;--text:#e7efff;--accent:#6aa5ff;--good:#53e3a6;--warn:#ffcc66;--bad:#ff6b6b;--line:#22355f;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;}
+*{box-sizing:border-box} body{margin:0;background:radial-gradient(1100px 700px at 20% 0%, #122652 0%, var(--bg) 55%);color:var(--text);font-family:var(--sans)}
+a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+header{padding:14px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;background:rgba(11,18,32,.86);backdrop-filter: blur(10px);z-index:10}
+h1{margin:0;font-size:14px} .sub{color:var(--muted);font-size:12px;margin-top:6px}
+.wrap{max-width:1200px;margin:0 auto;padding:14px;display:grid;grid-template-columns:240px 1fr;gap:14px}
+.card{background:linear-gradient(180deg, rgba(17,31,63,.92), rgba(15,26,51,.92));border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.card h2{margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:13px}
+.card .body{padding:12px 14px}
+.nav a{display:block;padding:10px 12px;border-radius:12px;border:1px solid var(--line);margin:8px 0;background:rgba(12,22,48,.55);color:var(--text)}
+.nav a:hover{border-color:var(--accent)}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 6px}
+input,select,textarea{width:100%;background:#0c1630;border:1px solid #274173;border-radius:12px;color:var(--text);padding:10px;font-size:13px;outline:none}
+textarea{min-height:120px;font-family:var(--mono);font-size:12px}
+button{background:#152a57;border:1px solid #2b4b86;color:var(--text);border-radius:12px;padding:10px 12px;font-size:13px;cursor:pointer}
+button.primary{background:linear-gradient(180deg,#2a63d6,#1e4fb1);border-color:#2b61c7}
+button.good{background:linear-gradient(180deg,#0f6b4a,#0a4a34);border-color:#158a61}
+button.bad{background:linear-gradient(180deg,#7a2424,#541818);border-color:#a23b3b}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+.hint{color:var(--muted);font-size:12px;line-height:1.55}
+pre{white-space:pre-wrap;word-break:break-word;background:rgba(12,22,48,.55);border:1px solid var(--line);border-radius:14px;padding:10px;font-family:var(--mono);font-size:12px}
+@media(max-width:980px){.wrap{grid-template-columns:1fr}}
+</style></head>
+<body>
+<header>
+  <h1>🧊 LXD WebPanel（前端独立VPS）</h1>
+  <div class="sub">入口：<b>${esc(ENTRY)}</b> · 当前：${u}</div>
+</header>
+<div class="wrap">
+  <div class="card"><h2>导航</h2><div class="body nav">
+    ${user? `<a href="${ENTRY}/home">首页</a>` : ``}
+    ${user && user.role==="admin" ? `
+      <a href="${ENTRY}/admin/nodes">节点/容器</a>
+      <a href="${ENTRY}/admin/users">用户管理</a>
+      <a href="${ENTRY}/admin/audit">审计</a>
+      <a href="${ENTRY}/admin/raw">Raw API</a>
+    ` : ``}
+    ${user && user.role!=="admin" ? `
+      <a href="${ENTRY}/user/instances">我的容器</a>
+      <a href="${ENTRY}/user/raw">Raw（仅限已授权容器）</a>
+    ` : ``}
+    ${user ? `<a href="${ENTRY}/logout">退出</a>` : `<a href="${ENTRY}/login">登录</a>`}
+  </div></div>
+  <div class="card"><h2>${esc(title)}</h2><div class="body">${body}</div></div>
 </div>
-
-<script>
-const { createApp } = Vue;
-createApp({
-  data(){
-    return {
-      base: "http://127.0.0.1:18080",
-      token: "",
-      loading:false,
-      error:"",
-      notice:"",
-      filter:"",
-      containers:[],
-      form:{ name:"", image:"images:debian/11", cpu:1, memory:512, disk:5, ports:"", ingress:null, egress:null }
-    }
-  },
-  computed:{
-    filtered(){
-      const kw=this.filter.trim().toLowerCase();
-      return this.containers.filter(x=>!kw||x.name.toLowerCase().includes(kw));
-    }
-  },
-  methods:{
-    async api(path, opt={}){
-      const url=this.base.replace(/\/+$/,"")+path;
-      const res=await fetch(url,{
-        headers:{ "Content-Type":"application/json", "X-Panel-Token": this.token },
-        ...opt
-      });
-      const data=await res.json().catch(()=>({}));
-      if(!res.ok) throw new Error(data?.error || data?.detail || `HTTP ${res.status}`);
-      return data;
-    },
-    normalize(raw){
-      return (raw||[]).map(it=>{
-        const name=it?.name||it?.Name||"unknown";
-        const status=String(it?.status||it?.Status||it?.state?.status||"Unknown");
-        const image=it?.config?.["image.description"]||it?.expanded_config?.["image.description"]||"";
-        let ipv4="";
-        try{
-          const net=it?.state?.network||{};
-          for(const nic of Object.values(net)){
-            const addrs=nic?.addresses||[];
-            const v4=addrs.find(a=>a.family==="inet");
-            if(v4?.address){ ipv4=v4.address; break; }
-          }
-        }catch(e){}
-        return {name,status,ipv4,image};
-      }).sort((a,b)=>a.name.localeCompare(b.name));
-    },
-    async refresh(){
-      this.error=""; this.notice=""; this.loading=true;
-      try{
-        const raw=await this.api("/api/list",{method:"GET"});
-        this.containers=this.normalize(raw);
-      }catch(e){ this.error=String(e.message||e); }
-      finally{ this.loading=false; }
-    },
-    async create(){
-      this.error=""; this.notice="";
-      if(!this.form.name.trim()){ this.notice="容器名不能为空"; return; }
-      const p={...this.form};
-      if(!p.ports) delete p.ports;
-      if(!p.ingress) delete p.ingress;
-      if(!p.egress) delete p.egress;
-      try{
-        await this.api("/api/create",{method:"POST",body:JSON.stringify(p)});
-        this.notice="创建已提交，稍等刷新。";
-        await this.refresh();
-      }catch(e){ this.error=String(e.message||e); }
-    },
-    async act(name,action){
-      this.error="";
-      try{
-        await this.api(`/api/action/${encodeURIComponent(name)}/${encodeURIComponent(action)}`,{method:"POST"});
-        await this.refresh();
-      }catch(e){ this.error=String(e.message||e); }
-    },
-    async del(name){
-      this.error="";
-      if(!confirm(`确认删除 ${name}？不可逆。`)) return;
-      try{
-        await this.api(`/api/delete/${encodeURIComponent(name)}`,{method:"DELETE"});
-        await this.refresh();
-      }catch(e){ this.error=String(e.message||e); }
-    }
-  },
-  mounted(){ /* 不自动刷新，避免没填 token 就报错 */ }
-}).mount("#app");
-</script>
-</body>
-</html>
-EOF
-
-  (cd "${APP_DIR}" && go build -o "${BIN_PATH}" main.go)
-  chmod +x "${BIN_PATH}"
-  ok "编译完成：${BIN_PATH}"
+</body></html>`;
 }
 
-# ------------------------------------------------------------------------------
-# 5) systemd 服务
-# ------------------------------------------------------------------------------
-install_service() {
-  echo -e "${YELLOW}[5/6] 配置 systemd 服务...${PLAIN}"
-  cat > /etc/systemd/system/lxd-hub.service <<EOF
+function jsonOk(res, data){ res.setHeader("Content-Type","application/json"); res.end(JSON.stringify({ok:true, ...data}, null, 2)); }
+function jsonErr(res, msg, status=400){ res.status(status).json({ok:false, error:String(msg||"error")}); }
+
+/** ---------------- Routes: Entry redirect ---------------- */
+app.get("/", (req,res)=>res.redirect(ENTRY + "/login"));
+app.get(ENTRY, (req,res)=>res.redirect(ENTRY + "/login"));
+
+/** ---------------- Login ---------------- */
+app.get(ENTRY + "/login", csrfProtection, async (req,res)=>{
+  const u = (req.query.user||"").toString();
+  const body = `
+    <div class="hint">像宝塔一样：入口路径是随机的。管理员可以在后台生成用户账号密码，并把登录链接发给用户。</div>
+    <form method="POST" action="${ENTRY}/login">
+      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+      <label>用户名</label><input name="username" value="${esc(u)}" required/>
+      <label>密码</label><input name="password" type="password" required/>
+      <div style="margin-top:12px"><button class="primary" type="submit">登录</button></div>
+    </form>
+  `;
+  res.send(layout("登录", null, body));
+});
+
+app.post(ENTRY + "/login", csrfProtection, async (req,res)=>{
+  const { username, password } = req.body || {};
+  try{
+    const row = await get("SELECT id,username,passhash,role,enabled FROM users WHERE username=?", [String(username||"")]);
+    if(!row) return res.send(layout("登录失败", null, `<div class="hint">账号或密码错误。</div>`));
+    if(Number(row.enabled)!==1) return res.send(layout("登录失败", null, `<div class="hint">账号已禁用。</div>`));
+    const okp = bcrypt.compareSync(String(password||""), row.passhash);
+    if(!okp) return res.send(layout("登录失败", null, `<div class="hint">账号或密码错误。</div>`));
+    req.session.user = { id: row.id, username: row.username, role: row.role };
+    await audit(row.username, "login", JSON.stringify({role:row.role}));
+    res.redirect(ENTRY + "/home");
+  }catch(e){
+    res.send(layout("登录失败", null, `<pre>${esc(e.message||String(e))}</pre>`));
+  }
+});
+
+app.get(ENTRY + "/logout", async (req,res)=>{
+  const u = req.session.user?.username || "unknown";
+  req.session.destroy(()=>{});
+  try{ await audit(u,"logout","{}"); }catch{}
+  res.redirect(ENTRY + "/login");
+});
+
+app.get(ENTRY + "/home", mustLogin, (req,res)=>{
+  const body = `
+    <div class="hint">
+      你现在登录的是 <b>${esc(req.session.user.username)}</b>（${esc(req.session.user.role)}）。
+      <br/>本面板运行在“独立前端 VPS”，通过后台代理调用 Panel API（解决跨域，统一权限）。
+    </div>
+    <div style="margin-top:10px" class="hint">
+      Panel URL：<b>${esc(PANEL_URL)}</b><br/>
+      入口路径：<b>${esc(ENTRY)}</b>
+    </div>
+  `;
+  res.send(layout("首页", req.session.user, body));
+});
+
+/** ---------------- Admin: Users ---------------- */
+app.get(ENTRY + "/admin/users", mustAdmin, csrfProtection, async (req,res)=>{
+  const users = await all("SELECT id,username,role,enabled,created_at FROM users ORDER BY id DESC");
+  const rows = users.map(u=>`
+    <tr>
+      <td>${u.id}</td><td>${esc(u.username)}</td><td>${esc(u.role)}</td>
+      <td>${Number(u.enabled)===1 ? "enabled" : "disabled"}</td>
+      <td class="mono">${esc(u.created_at)}</td>
+    </tr>`).join("");
+
+  const body = `
+    <div class="hint">管理员可以创建用户、重置密码、禁用用户，并把“登录链接 + 账号密码”发给用户。</div>
+    <form method="POST" action="${ENTRY}/admin/users/create">
+      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+      <div class="row">
+        <div><label>用户名</label><input name="username" placeholder="user001" required/></div>
+        <div><label>角色</label>
+          <select name="role"><option value="user" selected>user</option><option value="admin">admin</option></select>
+        </div>
+      </div>
+      <div style="margin-top:12px"><button class="good" type="submit">创建用户（自动生成密码）</button></div>
+    </form>
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+    <form method="POST" action="${ENTRY}/admin/users/reset">
+      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+      <div class="row">
+        <div><label>重置密码：用户名</label><input name="username" placeholder="user001" required/></div>
+        <div style="display:flex;align-items:end"><button type="submit">重置密码（生成新密码）</button></div>
+      </div>
+    </form>
+    <form method="POST" action="${ENTRY}/admin/users/toggle" style="margin-top:10px">
+      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+      <div class="row">
+        <div><label>启用/禁用：用户名</label><input name="username" placeholder="user001" required/></div>
+        <div>
+          <label>操作</label>
+          <select name="enabled"><option value="1">启用</option><option value="0">禁用</option></select>
+        </div>
+      </div>
+      <div style="margin-top:12px"><button class="bad" type="submit">执行</button></div>
+    </form>
+
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+    <h3 style="margin:0 0 8px;font-size:13px">用户列表</h3>
+    <div style="overflow:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr>
+          <th style="text-align:left;padding:8px;border-bottom:1px solid var(--line)">ID</th>
+          <th style="text-align:left;padding:8px;border-bottom:1px solid var(--line)">Username</th>
+          <th style="text-align:left;padding:8px;border-bottom:1px solid var(--line)">Role</th>
+          <th style="text-align:left;padding:8px;border-bottom:1px solid var(--line)">Status</th>
+          <th style="text-align:left;padding:8px;border-bottom:1px solid var(--line)">Created</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+    <div class="hint">
+      用户登录链接模板：<b>${esc(ENTRY)}/login?user=USERNAME</b>（把 USERNAME 换成用户名）
+    </div>
+  `;
+  res.send(layout("用户管理", req.session.user, body));
+});
+
+app.post(ENTRY + "/admin/users/create", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const username = String(req.body.username||"").trim();
+    const role = (String(req.body.role||"user")==="admin") ? "admin" : "user";
+    if(!username) throw new Error("username empty");
+    const pw = (cfg.user_password_policy==="fixed") ? (cfg.default_user_pass||"123456") : (Math.random().toString(36).slice(2,10) + randHex(4));
+    const passhash = bcrypt.hashSync(pw, 10);
+    await run("INSERT INTO users(username, passhash, role, enabled, created_at) VALUES(?,?,?,?,?)",
+      [username, passhash, role, 1, new Date().toISOString()]);
+    await audit(req.session.user.username, "user.create", JSON.stringify({username, role}));
+
+    const ip = cfg.public_host || req.headers.host;
+    const link = `http://${ip}${ENTRY}/login?user=${encodeURIComponent(username)}`;
+    const body = `
+      <div class="hint">用户已创建（密码只展示一次，记得复制给用户）。</div>
+      <pre>登录链接：${link}
+账号：${username}
+密码：${pw}
+角色：${role}</pre>
+      <div class="hint">下一步：去“节点/容器”页，把某些容器分配给该用户（否则用户登录后看不到任何容器）。</div>
+      <div style="margin-top:10px"><a href="${ENTRY}/admin/users">返回</a></div>
+    `;
+    res.send(layout("创建成功", req.session.user, body));
+  }catch(e){
+    res.send(layout("创建失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/users">返回</a>`));
+  }
+});
+
+function randHex(n){ return [...crypto.getRandomValues(new Uint8Array(n/2))].map(x=>x.toString(16).padStart(2,'0')).join(''); }
+
+app.post(ENTRY + "/admin/users/reset", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const username = String(req.body.username||"").trim();
+    if(!username) throw new Error("username empty");
+    const pw = (Math.random().toString(36).slice(2,10) + "-" + Math.random().toString(36).slice(2,6));
+    const passhash = bcrypt.hashSync(pw, 10);
+    const r = await run("UPDATE users SET passhash=? WHERE username=?", [passhash, username]);
+    if(r.changes===0) throw new Error("user not found");
+    await audit(req.session.user.username, "user.reset", JSON.stringify({username}));
+    const ip = cfg.public_host || req.headers.host;
+    const link = `http://${ip}${ENTRY}/login?user=${encodeURIComponent(username)}`;
+    res.send(layout("重置成功", req.session.user, `<pre>登录链接：${link}\n账号：${username}\n新密码：${pw}</pre><a href="${ENTRY}/admin/users">返回</a>`));
+  }catch(e){
+    res.send(layout("重置失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/users">返回</a>`));
+  }
+});
+
+app.post(ENTRY + "/admin/users/toggle", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const username = String(req.body.username||"").trim();
+    const enabled = Number(req.body.enabled||"0")===1 ? 1 : 0;
+    const r = await run("UPDATE users SET enabled=? WHERE username=?", [enabled, username]);
+    if(r.changes===0) throw new Error("user not found");
+    await audit(req.session.user.username, "user.toggle", JSON.stringify({username, enabled}));
+    res.redirect(ENTRY + "/admin/users");
+  }catch(e){
+    res.send(layout("操作失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/users">返回</a>`));
+  }
+});
+
+/** ---------------- Admin: Nodes/Instances ---------------- */
+app.get(ENTRY + "/admin/nodes", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const nodes = await panelFetch("GET", "/nodes");
+    const list = (nodes.nodes||[]).map(n=>`<option value="${esc(n.id)}">${esc(n.name)} (${esc(n.id)}) @ ${esc(n.url)}</option>`).join("");
+    const body = `
+      <div class="hint">这里直接通过本服务代理调用 Panel：/nodes、/nodes/{id}/...（解决跨域 & 统一鉴权）。</div>
+
+      <form method="POST" action="${ENTRY}/admin/node/instances" style="margin-top:10px">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <label>选择节点</label>
+        <select name="node_id" required>
+          <option value="">-- 选择节点 --</option>
+          ${list}
+        </select>
+        <div style="margin-top:12px"><button class="primary" type="submit">查看该节点容器列表</button></div>
+      </form>
+
+      <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+
+      <form method="POST" action="${ENTRY}/admin/pair_token">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <div class="row">
+          <div><label>生成 Pair Token TTL（秒）</label><input name="ttl" value="600" type="number" min="60" max="3600"/></div>
+          <div style="display:flex;align-items:end"><button class="good" type="submit">生成 Pair Token</button></div>
+        </div>
+      </form>
+    `;
+    res.send(layout("节点/容器", req.session.user, body));
+  }catch(e){
+    res.send(layout("节点/容器", req.session.user, `<pre>${esc(e.message||String(e))}</pre>`));
+  }
+});
+
+app.post(ENTRY + "/admin/pair_token", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const ttl = Math.max(60, Math.min(3600, Number(req.body.ttl||600)));
+    const r = await panelFetch("POST", `/nodes/pair_token?ttl_seconds=${ttl}`);
+    await audit(req.session.user.username, "pair_token.create", JSON.stringify({ttl}));
+    const body = `<pre>Pair Token：${r.token}\nexpires_in：${r.expires_in}s</pre>
+    <div class="hint">把 token 贴到“节点安装脚本”的 enroll 步骤即可。</div>
+    <a href="${ENTRY}/admin/nodes">返回</a>`;
+    res.send(layout("Pair Token", req.session.user, body));
+  }catch(e){
+    res.send(layout("生成失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/nodes">返回</a>`));
+  }
+});
+
+app.post(ENTRY + "/admin/node/instances", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const nodeId = String(req.body.node_id||"").trim();
+    if(!nodeId) throw new Error("node_id empty");
+    const inst = await panelFetch("GET", `/nodes/${encodeURIComponent(nodeId)}/instances`);
+    const rows = (inst.instances||[]).map(x=>{
+      const name = x?.name || x?.Name || x?.instance || x?.server_name || x?.metadata?.name || "";
+      const st = x?.status || x?.Status || x?.state || x?.status_code || "";
+      return `<tr>
+        <td style="padding:8px;border-bottom:1px solid rgba(34,53,95,.55)">${esc(name)}</td>
+        <td style="padding:8px;border-bottom:1px solid rgba(34,53,95,.55)">${esc(String(st))}</td>
+      </tr>`;
+    }).join("");
+
+    const body = `
+      <div class="hint">节点：<b>${esc(nodeId)}</b></div>
+
+      <h3 style="margin:10px 0 8px;font-size:13px">创建容器</h3>
+      <form method="POST" action="${ENTRY}/admin/instance/create">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <input type="hidden" name="node_id" value="${esc(nodeId)}"/>
+        <div class="row">
+          <div><label>容器名</label><input name="name" required placeholder="ct-001"/></div>
+          <div><label>镜像</label><input name="image" value="images:ubuntu/22.04"/></div>
+        </div>
+        <div class="row3">
+          <div><label>CPU 核心</label><input name="cpu_cores" type="number" min="1" placeholder="2"/></div>
+          <div><label>CPU 上限%</label><input name="cpu_limit_percent" type="number" min="1" max="100" placeholder="50"/></div>
+          <div><label>内存 MB</label><input name="memory_mb" type="number" min="128" placeholder="2048"/></div>
+        </div>
+        <div class="row3">
+          <div><label>磁盘 GB</label><input name="disk_gb" type="number" min="1" placeholder="20"/></div>
+          <div><label>上行 Mbit</label><input name="up_mbit" type="number" min="1" placeholder="50"/></div>
+          <div><label>下行 Mbit</label><input name="down_mbit" type="number" min="1" placeholder="200"/></div>
+        </div>
+        <div style="margin-top:12px"><button class="good" type="submit">创建</button></div>
+      </form>
+
+      <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+      <h3 style="margin:0 0 8px;font-size:13px">容器列表（原样返回，可能字段因 LXD 版本略不同）</h3>
+      <pre>${esc(JSON.stringify(inst, null, 2))}</pre>
+
+      <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+      <h3 style="margin:0 0 8px;font-size:13px">给用户分配容器（RBAC 映射）</h3>
+      <form method="POST" action="${ENTRY}/admin/assign">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <input type="hidden" name="node_id" value="${esc(nodeId)}"/>
+        <div class="row">
+          <div><label>用户名</label><input name="username" placeholder="user001" required/></div>
+          <div><label>容器名（instance_name）</label><input name="instance_name" placeholder="ct-001" required/></div>
+        </div>
+        <div style="margin-top:12px"><button type="submit">分配给用户</button></div>
+      </form>
+
+      <div style="margin-top:10px"><a href="${ENTRY}/admin/nodes">返回</a></div>
+    `;
+    res.send(layout("节点容器", req.session.user, body));
+  }catch(e){
+    res.send(layout("容器列表失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/nodes">返回</a>`));
+  }
+});
+
+app.post(ENTRY + "/admin/instance/create", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const node_id = String(req.body.node_id||"").trim();
+    const name = String(req.body.name||"").trim();
+    const image = String(req.body.image||"images:ubuntu/22.04").trim();
+    if(!node_id || !name) throw new Error("node_id/name empty");
+
+    const payload = { name, image };
+    const takeNum = (k)=>{ const v = Number(req.body[k]); return Number.isFinite(v) && v>0 ? v : null; };
+    const cpu = takeNum("cpu_cores");
+    const cpuPct = takeNum("cpu_limit_percent");
+    const mem = takeNum("memory_mb");
+    const disk = takeNum("disk_gb");
+    const up = takeNum("up_mbit");
+    const down = takeNum("down_mbit");
+    if(cpu) payload.cpu_cores = cpu;
+    if(cpuPct) payload.cpu_limit_percent = cpuPct;
+    if(mem) payload.memory_mb = mem;
+    if(disk) payload.disk_gb = disk;
+    if(up) payload.up_mbit = up;
+    if(down) payload.down_mbit = down;
+
+    const r = await panelFetch("POST", `/nodes/${encodeURIComponent(node_id)}/instances`, payload);
+    await audit(req.session.user.username, "instance.create", JSON.stringify({node_id, name}));
+    res.send(layout("创建结果", req.session.user, `<pre>${esc(JSON.stringify(r,null,2))}</pre><a href="${ENTRY}/admin/nodes">返回</a>`));
+  }catch(e){
+    res.send(layout("创建失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/nodes">返回</a>`));
+  }
+});
+
+app.post(ENTRY + "/admin/assign", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const username = String(req.body.username||"").trim();
+    const node_id = String(req.body.node_id||"").trim();
+    const instance_name = String(req.body.instance_name||"").trim();
+    if(!username || !node_id || !instance_name) throw new Error("missing fields");
+    const u = await get("SELECT id,role FROM users WHERE username=?", [username]);
+    if(!u) throw new Error("user not found");
+    if(u.role!=="user") throw new Error("只能分配给 user 角色（admin 不需要分配）");
+
+    await run("INSERT OR IGNORE INTO assignments(user_id,node_id,instance_name,created_at) VALUES(?,?,?,?)",
+      [u.id, node_id, instance_name, new Date().toISOString()]);
+    await audit(req.session.user.username, "assign.add", JSON.stringify({username,node_id,instance_name}));
+    res.send(layout("分配成功", req.session.user, `<pre>已分配：${esc(username)} -> ${esc(node_id)} / ${esc(instance_name)}</pre><a href="${ENTRY}/admin/nodes">返回</a>`));
+  }catch(e){
+    res.send(layout("分配失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/nodes">返回</a>`));
+  }
+});
+
+/** ---------------- Admin/Raw & Audit ---------------- */
+app.get(ENTRY + "/admin/audit", mustAdmin, async (req,res)=>{
+  const rows = await all("SELECT * FROM audit ORDER BY id DESC LIMIT 200");
+  res.send(layout("本面板审计", req.session.user, `<pre>${esc(JSON.stringify(rows,null,2))}</pre>`));
+});
+
+app.get(ENTRY + "/admin/raw", mustAdmin, csrfProtection, (req,res)=>{
+  const body = `
+    <div class="hint">Raw API：直接代理调用 Panel。method/path/body 自己填。</div>
+    <form method="POST" action="${ENTRY}/admin/raw">
+      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+      <div class="row">
+        <div><label>Method</label>
+          <select name="method"><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select>
+        </div>
+        <div><label>Path（以 / 开头）</label><input name="path" value="/nodes"/></div>
+      </div>
+      <label>JSON Body（可空）</label><textarea name="body" placeholder='{"a":1}'></textarea>
+      <div style="margin-top:12px"><button class="primary" type="submit">发送</button></div>
+    </form>
+  `;
+  res.send(layout("Raw API", req.session.user, body));
+});
+
+app.post(ENTRY + "/admin/raw", mustAdmin, csrfProtection, async (req,res)=>{
+  try{
+    const method = String(req.body.method||"GET").toUpperCase();
+    const p = String(req.body.path||"/health").trim();
+    if(!p.startsWith("/")) throw new Error("path must start with /");
+    const bodyText = String(req.body.body||"").trim();
+    let body = undefined;
+    if(bodyText) { body = JSON.parse(bodyText); }
+    const r = await panelFetch(method, p, body);
+    await audit(req.session.user.username, "raw", JSON.stringify({method,path:p}));
+    res.send(layout("Raw 结果", req.session.user, `<pre>${esc(JSON.stringify(r,null,2))}</pre><a href="${ENTRY}/admin/raw">返回</a>`));
+  }catch(e){
+    res.send(layout("Raw 失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/admin/raw">返回</a>`));
+  }
+});
+
+/** ---------------- User portal ---------------- */
+app.get(ENTRY + "/user/instances", mustUser, csrfProtection, async (req,res)=>{
+  const me = req.session.user;
+  if(me.role==="admin"){
+    return res.send(layout("提示", me, `<div class="hint">你是 admin，建议去“节点/容器”页管理全局。</div>`));
+  }
+
+  const asg = await all(
+    "SELECT a.node_id,a.instance_name FROM assignments a WHERE a.user_id=? ORDER BY a.node_id,a.instance_name",
+    [me.id]
+  );
+
+  const list = asg.map(x=>`<option value="${esc(x.node_id)}::${esc(x.instance_name)}">${esc(x.node_id)} / ${esc(x.instance_name)}</option>`).join("");
+  const body = `
+    <div class="hint">用户端只能操作管理员分配给你的容器。</div>
+
+    <h3 style="margin:10px 0 8px;font-size:13px">我的容器（选择一个）</h3>
+    <select id="pick" style="width:100%">${list || `<option value="">(暂无分配)</option>`}</select>
+
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+    <form method="POST" action="${ENTRY}/user/action">
+      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+      <label>动作</label>
+      <select name="action">
+        <option value="list_ports">查看端口池</option>
+        <option value="list_instances">查看该节点容器列表</option>
+        <option value="add_port">添加端口映射</option>
+        <option value="del_port">删除端口映射</option>
+        <option value="set_limits">设置限制（含带宽）</option>
+        <option value="reinstall">重装（危险）</option>
+        <option value="create_user">容器内创建用户</option>
+      </select>
+
+      <div class="row">
+        <div><label>host_port（删除映射用）</label><input name="host_port" placeholder="20001"/></div>
+        <div><label>container_port（添加映射用）</label><input name="container_port" placeholder="22"/></div>
+      </div>
+      <div class="row">
+        <div><label>proto</label><select name="proto"><option value="tcp">tcp</option><option value="udp">udp</option></select></div>
+        <div><label>指定宿主机端口（可空=自动分配）</label><input name="host_port_add" placeholder="2222"/></div>
+      </div>
+
+      <div class="row3">
+        <div><label>CPU 核心</label><input name="cpu_cores" placeholder="2"/></div>
+        <div><label>CPU 上限%</label><input name="cpu_limit_percent" placeholder="50"/></div>
+        <div><label>内存MB</label><input name="memory_mb" placeholder="2048"/></div>
+      </div>
+      <div class="row3">
+        <div><label>磁盘GB</label><input name="disk_gb" placeholder="20"/></div>
+        <div><label>上行Mbit</label><input name="up_mbit" placeholder="50"/></div>
+        <div><label>下行Mbit</label><input name="down_mbit" placeholder="200"/></div>
+      </div>
+
+      <div class="row">
+        <div><label>重装镜像</label><input name="image" value="images:debian/12"/></div>
+        <div><label>保留端口/限制</label>
+          <select name="preserve"><option value="1" selected>保留</option><option value="0">不保留</option></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div><label>容器内用户名</label><input name="linux_user" placeholder="alice"/></div>
+        <div><label>容器内密码（可空）</label><input name="linux_pass" placeholder="optional"/></div>
+      </div>
+      <label>SSH 公钥（可空）</label><textarea name="ssh_key" placeholder="ssh-ed25519 AAAA..."></textarea>
+
+      <input type="hidden" name="pick" id="pickHidden"/>
+      <div style="margin-top:12px"><button class="primary" type="submit">执行</button></div>
+    </form>
+
+    <script>
+      const s = document.getElementById("pick");
+      const h = document.getElementById("pickHidden");
+      function sync(){ h.value = s.value; }
+      sync(); s.addEventListener("change", sync);
+    </script>
+  `;
+  res.send(layout("我的容器", me, body));
+});
+
+function parsePick(pick){
+  const [node_id, instance_name] = String(pick||"").split("::");
+  if(!node_id || !instance_name) throw new Error("未选择容器");
+  return { node_id, instance_name };
+}
+
+async function userAllowed(userId, node_id, instance_name){
+  const row = await get(
+    "SELECT 1 AS ok FROM assignments WHERE user_id=? AND node_id=? AND instance_name=?",
+    [userId, node_id, instance_name]
+  );
+  return !!row;
+}
+
+app.post(ENTRY + "/user/action", mustUser, csrfProtection, async (req,res)=>{
+  const me = req.session.user;
+  try{
+    if(me.role==="admin") throw new Error("admin 请走管理端");
+    const { node_id, instance_name } = parsePick(req.body.pick);
+    const allowed = await userAllowed(me.id, node_id, instance_name);
+    if(!allowed) return res.status(403).send(layout("拒绝", me, "<div class='hint'>你没有权限操作该容器。</div>"));
+
+    const action = String(req.body.action||"").trim();
+    const num = (k)=>{ const v = Number(req.body[k]); return Number.isFinite(v) && v>0 ? v : null; };
+
+    let r = null;
+    if(action==="list_ports"){
+      r = await panelFetch("GET", `/nodes/${encodeURIComponent(node_id)}/ports`);
+    }else if(action==="list_instances"){
+      r = await panelFetch("GET", `/nodes/${encodeURIComponent(node_id)}/instances`);
+    }else if(action==="add_port"){
+      const cp = num("container_port"); if(!cp) throw new Error("container_port 必填");
+      const proto = String(req.body.proto||"tcp");
+      const hp = num("host_port_add");
+      const payload = { container_port: cp, proto };
+      if(hp) payload.host_port = hp;
+      r = await panelFetch("POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/ports`, payload);
+    }else if(action==="del_port"){
+      const hp = num("host_port"); if(!hp) throw new Error("host_port 必填");
+      r = await panelFetch("DELETE", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/ports/${hp}`);
+    }else if(action==="set_limits"){
+      const payload = {};
+      const cpu = num("cpu_cores"); if(cpu) payload.cpu_cores = cpu;
+      const cpuPct = num("cpu_limit_percent"); if(cpuPct) payload.cpu_limit_percent = cpuPct;
+      const mem = num("memory_mb"); if(mem) payload.memory_mb = mem;
+      const disk = num("disk_gb"); if(disk) payload.disk_gb = disk;
+      const up = num("up_mbit"); if(up) payload.up_mbit = up;
+      const down = num("down_mbit"); if(down) payload.down_mbit = down;
+      if(Object.keys(payload).length===0) throw new Error("至少填一个限制项");
+      r = await panelFetch("POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/limits`, payload);
+    }else if(action==="reinstall"){
+      const image = String(req.body.image||"").trim(); if(!image) throw new Error("image 必填");
+      const preserve = String(req.body.preserve||"1")==="1";
+      r = await panelFetch("POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/reinstall`, {
+        image, preserve_ports: preserve, preserve_limits: preserve
+      });
+    }else if(action==="create_user"){
+      const username = String(req.body.linux_user||"").trim(); if(!username) throw new Error("linux_user 必填");
+      const payload = { username, sudo: true };
+      const pw = String(req.body.linux_pass||"").trim(); if(pw) payload.password = pw;
+      const key = String(req.body.ssh_key||"").trim(); if(key) payload.ssh_public_key = key;
+      r = await panelFetch("POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/users`, payload);
+    }else{
+      throw new Error("未知 action");
+    }
+
+    await audit(me.username, "user.action", JSON.stringify({node_id, instance_name, action}));
+    res.send(layout("执行结果", me, `<pre>${esc(JSON.stringify(r,null,2))}</pre><a href="${ENTRY}/user/instances">返回</a>`));
+  }catch(e){
+    res.send(layout("执行失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/user/instances">返回</a>`));
+  }
+});
+
+app.get(ENTRY + "/user/raw", mustUser, csrfProtection, async (req,res)=>{
+  const me = req.session.user;
+  const body = `
+    <div class="hint">
+      这是“用户 Raw”，为了安全：你仍然只能对“已分配的容器”做操作。
+      如果你要更开放的 raw（比如 /nodes/{id}/instances），建议在管理员端用 Raw。
+    </div>
+    <form method="POST" action="${ENTRY}/user/raw">
+      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+      <div class="row">
+        <div><label>node_id</label><input name="node_id" placeholder="必须是分配给你的节点"/></div>
+        <div><label>instance_name</label><input name="instance_name" placeholder="必须是分配给你的容器"/></div>
+      </div>
+      <div class="row">
+        <div><label>Method</label><select name="method"><option>GET</option><option>POST</option><option>DELETE</option><option>PUT</option><option>PATCH</option></select></div>
+        <div><label>Node Path（以 / 开头，比如 /instances/{name}/limits）</label><input name="path" value="/instances/ct-001/limits"/></div>
+      </div>
+      <label>JSON Body（可空）</label><textarea name="body" placeholder='{"memory_mb":2048}'></textarea>
+      <div style="margin-top:12px"><button class="primary" type="submit">发送</button></div>
+    </form>
+  `;
+  res.send(layout("用户 Raw", me, body));
+});
+
+app.post(ENTRY + "/user/raw", mustUser, csrfProtection, async (req,res)=>{
+  const me = req.session.user;
+  try{
+    const node_id = String(req.body.node_id||"").trim();
+    const instance_name = String(req.body.instance_name||"").trim();
+    if(!node_id || !instance_name) throw new Error("node_id/instance_name 必填");
+    const allowed = await userAllowed(me.id, node_id, instance_name);
+    if(!allowed) throw new Error("你无权操作该容器");
+
+    const method = String(req.body.method||"GET").toUpperCase();
+    const p = String(req.body.path||"").trim();
+    if(!p.startsWith("/")) throw new Error("path must start with /");
+    // 额外限制：必须包含该容器名，避免用户越权打到别的容器
+    if(!p.includes(encodeURIComponent(instance_name)) && !p.includes(instance_name)) {
+      throw new Error("为防越权，path 必须包含 instance_name");
+    }
+    const bodyText = String(req.body.body||"").trim();
+    let body = undefined;
+    if(bodyText) body = JSON.parse(bodyText);
+
+    const r = await panelFetch(method, `/nodes/${encodeURIComponent(node_id)}${p}`, body);
+    await audit(me.username, "user.raw", JSON.stringify({node_id, instance_name, method, path:p}));
+    res.send(layout("Raw 结果", me, `<pre>${esc(JSON.stringify(r,null,2))}</pre><a href="${ENTRY}/user/raw">返回</a>`));
+  }catch(e){
+    res.send(layout("Raw 失败", req.session.user, `<pre>${esc(e.message||String(e))}</pre><a href="${ENTRY}/user/raw">返回</a>`));
+  }
+});
+
+/** ---------------- Health ---------------- */
+app.get(ENTRY + "/health", async (req,res)=>{
+  try{
+    const r = await panelFetch("GET","/health");
+    jsonOk(res,{ service:"lxd-webpanel", panel_health:r, entry:ENTRY });
+  }catch(e){
+    jsonErr(res, e.message||String(e), 502);
+  }
+});
+
+/** ---------------- Start ---------------- */
+await initDb();
+
+app.listen(PORT, "0.0.0.0", ()=>{
+  console.log(`[lxd-webpanel] listen :${PORT}`);
+  console.log(`[lxd-webpanel] entry  ${ENTRY}/login`);
+});
+JS
+
+  ok "应用文件写入完成"
+}
+
+npm_install() {
+  info "安装 npm 依赖（首次会稍慢）..."
+  cd "$APP_DIR"
+  npm install --omit=dev
+  ok "npm 依赖安装完成"
+}
+
+write_config() {
+  info "生成配置..."
+  local entry="/$(rand_hex 10)"
+  local admin_user="admin"
+  local admin_pass="$(rand_pw 18)"
+  local session_secret="$(rand_pw 32)"
+
+  read -r -p "请输入 Panel URL（例如 http://PANEL_IP:9876）: " panel_url
+  read -r -p "请输入 Panel admin 用户名（默认 admin）: " panel_admin_user
+  read -r -p "请输入 Panel admin 密码（来自 /etc/lxd-panel-v2/panel.admin.pass）: " panel_admin_pass
+
+  panel_admin_user="${panel_admin_user:-admin}"
+
+  [[ -n "${panel_url:-}" ]] || die "Panel URL 不能为空"
+  [[ -n "${panel_admin_pass:-}" ]] || die "Panel admin 密码不能为空"
+
+  mkdir -p "$CFG_DIR" "$DATA_DIR"
+  chmod 750 "$DATA_DIR" || true
+
+  cat > "${CFG_DIR}/config.json" << EOF
+{
+  "listen_port": ${PORT},
+  "entry_path": "${entry}",
+  "panel_url": "${panel_url%/}",
+  "panel_admin_user": "${panel_admin_user}",
+  "panel_admin_pass": "${panel_admin_pass}",
+  "admin_user": "${admin_user}",
+  "admin_pass": "${admin_pass}",
+  "session_secret": "${session_secret}",
+  "public_host": ""
+}
+EOF
+  chmod 600 "${CFG_DIR}/config.json"
+  ok "配置已生成：${CFG_DIR}/config.json"
+
+  echo "${entry}" > "${CFG_DIR}/entry.path"
+  echo "${admin_user}" > "${CFG_DIR}/admin.user"
+  echo "${admin_pass}" > "${CFG_DIR}/admin.pass"
+  chmod 600 "${CFG_DIR}/entry.path" "${CFG_DIR}/admin.user" "${CFG_DIR}/admin.pass"
+}
+
+write_systemd() {
+  info "注册 systemd..."
+  cat > "/etc/systemd/system/${SERVICE_NAME}.service" << EOF
 [Unit]
-Description=LXD Hub (Go single binary) - Panel+API + mTLS API
-After=network.target snap.lxd.daemon.service
-Wants=snap.lxd.daemon.service
+Description=LXD WebPanel (Admin/User, proxy to Panel)
+After=network.target
 
 [Service]
+Type=simple
+Environment=CFG_PATH=${CFG_DIR}/config.json
+Environment=DATA_DIR=${DATA_DIR}
 WorkingDirectory=${APP_DIR}
-ExecStart=${BIN_PATH}
+ExecStart=/usr/bin/node ${APP_DIR}/server.js
 Restart=always
 RestartSec=2
-# 可选：覆盖端口
-Environment=MTLS_PORT=${MTLS_PORT}
-Environment=PANEL_PORT=${PANEL_PORT}
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=${DATA_DIR} ${CFG_DIR} ${APP_DIR}
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now lxd-hub >/dev/null
-  ok "服务已启动：lxd-hub"
+  systemctl enable "${SERVICE_NAME}" >/dev/null
+  systemctl restart "${SERVICE_NAME}"
+  ok "服务已启动：${SERVICE_NAME}"
 }
 
-# ------------------------------------------------------------------------------
-# 6) 放行端口 + 输出信息
-# ------------------------------------------------------------------------------
-configure_firewall_and_print() {
-  echo -e "${YELLOW}[6/6] 配置防火墙与输出信息...${PLAIN}"
-  ufw allow 22/tcp >/dev/null 2>&1 || true
-  ufw allow "${MTLS_PORT}/tcp" >/dev/null 2>&1 || true
-  ufw allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true
+show_result() {
+  local ip entry admin_user admin_pass
+  ip="$(host_ip)"
+  entry="$(cat "${CFG_DIR}/entry.path")"
+  admin_user="$(cat "${CFG_DIR}/admin.user")"
+  alignment="=========================================================="
+  admin_pass="$(cat "${CFG_DIR}/admin.pass")"
 
-  HOST_IP="$(hostname -I | awk '{print $1}')"
-  [[ -z "${HOST_IP}" ]] && HOST_IP="127.0.0.1"
-  PANEL_TOKEN="$(cat "${DATA_DIR}/panel.token")"
+  echo -e "\n${GREEN}${alignment}${PLAIN}"
+  echo -e "${GREEN}[LXD WebPanel 已部署完成]${PLAIN}"
+  echo -e "登录入口：${BLUE}http://${ip}:${PORT}${entry}/login${PLAIN}"
+  echo -e "管理员账号：${YELLOW}${admin_user}${PLAIN}"
+  echo -e "管理员密码：${YELLOW}${admin_pass}${PLAIN}"
+  echo -e "${GREEN}${alignment}${PLAIN}\n"
 
-  # mTLS Token（给外部程序/别的面板导入用）
-  JSON_DATA="$(jq -n \
-    --arg url "https://${HOST_IP}:${MTLS_PORT}" \
-    --arg ca "$(cat ${CERT_DIR}/ca.crt)" \
-    --arg cert "$(cat ${CERT_DIR}/client.crt)" \
-    --arg key "$(cat ${CERT_DIR}/client.key)" \
-    '{api_url:$url, ca_cert:$ca, client_cert:$cert, client_key:$key}')"
-  MTLS_TOKEN="$(echo "$JSON_DATA" | base64 -w0)"
-
-  echo -e "\n${GREEN}==============================================${PLAIN}"
-  echo -e "${GREEN}  LXD Hub 安装完成（Go 单体版）${PLAIN}"
-  echo -e "${GREEN}==============================================${PLAIN}"
-  echo -e "面板地址:     http://${HOST_IP}:${PANEL_PORT}   （需要 X-Panel-Token）"
-  echo -e "面板文件:     ${PANEL_DIR}/panel.html"
-  echo -e "面板 Token:   ${YELLOW}${PANEL_TOKEN}${PLAIN}"
-  echo -e ""
-  echo -e "mTLS API:     https://${HOST_IP}:${MTLS_PORT}   （客户端证书认证）"
-  echo -e "mTLS 导入Token（含证书）:"
-  echo -e "${YELLOW}${MTLS_TOKEN}${PLAIN}"
-  echo -e ""
-  warn "安全建议：18080 仍建议只对内网开放，或你让我加 IP 白名单/HTTPS/登录。"
+  echo -e "${YELLOW}建议（生产）：${PLAIN}"
+  echo -e "1) 用 Nginx 做 HTTPS + 反代到 127.0.0.1:${PORT}（防止明文登录）"
+  echo -e "2) entry_path 入口不要泄露给无关人员（像宝塔一样）"
+  echo -e "3) Panel 与 Node-Agent 通信建议走内网/VPN/mTLS\n"
 }
 
-# ------------------------------------------------------------------------------
-# Run
-# ------------------------------------------------------------------------------
-install_deps
-install_lxd
-generate_secrets
-build_go
-install_service
-configure_firewall_and_print
+main() {
+  install_deps
+  install_node
+  write_app_files
+  npm_install
+  write_config
+  write_systemd
+  show_result
+}
+
+main
