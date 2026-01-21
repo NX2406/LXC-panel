@@ -21,7 +21,7 @@ rand_pw(){ tr -dc 'A-Za-z0-9_@#%+=' </dev/urandom | head -c "${1:-18}"; }
 
 host_ip() {
   local ip
-  ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
   [[ -z "${ip}" ]] && ip="127.0.0.1"
   echo "$ip"
 }
@@ -29,7 +29,7 @@ host_ip() {
 install_deps(){
   info "安装系统依赖..."
   apt-get update -y
-  apt-get install -y ca-certificates curl gnupg git sqlite3 build-essential python3 make g++
+  apt-get install -y ca-certificates curl gnupg sqlite3 build-essential python3 make g++
   ok "系统依赖安装完成"
 }
 
@@ -52,7 +52,7 @@ write_files(){
   cat > "$APP_DIR/package.json" <<'JSON'
 {
   "name": "lxd-3xui-panel",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "main": "server.js",
@@ -219,16 +219,19 @@ app.use(session({
 
 const csrfProtection = csrf({ cookie:false });
 
+/** ---- FIX #1: 禁止 Forbidden 白屏 —— 统一跳登录页 ---- */
 function mustLogin(req,res,next){
   if(!req.session.user) return res.redirect(ENTRY + "/login");
   next();
 }
 function mustAdmin(req,res,next){
-  if(!req.session.user || req.session.user.role!=="admin") return res.status(403).send("Forbidden");
+  if(!req.session.user) return res.redirect(ENTRY + "/login");
+  if(req.session.user.role!=="admin") return res.redirect(ENTRY + "/login");
   next();
 }
 function mustUser(req,res,next){
-  if(!req.session.user || (req.session.user.role!=="user" && req.session.user.role!=="admin")) return res.status(403).send("Forbidden");
+  if(!req.session.user) return res.redirect(ENTRY + "/login");
+  if(req.session.user.role!=="user" && req.session.user.role!=="admin") return res.redirect(ENTRY + "/login");
   next();
 }
 
@@ -343,7 +346,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:rgba(10,15,20,.35);bor
 
 function banner(msg){ return `<div class="banner">${msg}</div>`; }
 
-/** ---- routes ---- */
+/** ---- ROUTES ---- */
 app.get("/", (req,res)=>res.redirect(ENTRY + "/login"));
 app.get(ENTRY, (req,res)=>res.redirect(ENTRY + "/login"));
 
@@ -387,13 +390,13 @@ app.get(ENTRY + "/logout", async (req,res)=>{
   res.redirect(ENTRY + "/login");
 });
 
-/** ---- Admin: dashboard ---- */
+/** ---- Admin dashboard ---- */
 app.get(ENTRY + "/admin/dashboard", mustAdmin, async (req,res)=>{
   const b = await pickDefaultBackend();
+  let bannerHtml = "";
+  if(!b) bannerHtml = banner("⚠️ 你还没有添加任何后端 Panel 连接：去【后端连接】添加。面板仍可独立使用（账号/用户/分配映射）。");
   const backends = await all("SELECT id,name,base_url,enabled,is_default,created_at FROM backends ORDER BY id DESC");
   const users = await all("SELECT id,username,role,enabled,created_at FROM users ORDER BY id DESC LIMIT 30");
-  let bannerHtml = "";
-  if(!b) bannerHtml = banner("⚠️ 你还没有添加任何后端 Panel 连接：去【后端连接】添加。面板仍可独立使用（账号/用户/分配关系等）。");
   const body = `
     <div class="grid2">
       <div class="card" style="border-radius:14px"><h2>后端连接概览</h2><div class="body">
@@ -410,7 +413,7 @@ app.get(ENTRY + "/admin/dashboard", mustAdmin, async (req,res)=>{
   res.send(layout("仪表盘", req.session.user, body, bannerHtml));
 });
 
-/** ---- Admin: backends (independent) ---- */
+/** ---- Admin backends ---- */
 app.get(ENTRY + "/admin/backends", mustAdmin, csrfProtection, async (req,res)=>{
   const rows = await all("SELECT * FROM backends ORDER BY id DESC");
   const body = `
@@ -436,7 +439,7 @@ app.get(ENTRY + "/admin/backends", mustAdmin, csrfProtection, async (req,res)=>{
 
     <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
 
-    <h3 style="margin:0 0 8px;font-size:13px">已添加后端</h3>
+    <h3 style="margin:0 0 8px;font-size:13px">已添加后端（脱敏展示）</h3>
     <pre>${esc(JSON.stringify(rows.map(r=>({id:r.id,name:r.name,base_url:r.base_url,enabled:r.enabled,is_default:r.is_default,created_at:r.created_at})), null, 2))}</pre>
 
     <form method="POST" action="${ENTRY}/admin/backends/set_default" style="margin-top:10px">
@@ -501,7 +504,7 @@ app.post(ENTRY + "/admin/backends/set_default", mustAdmin, csrfProtection, async
 app.post(ENTRY + "/admin/backends/toggle", mustAdmin, csrfProtection, async (req,res)=>{
   try{
     const id = Number(req.body.id);
-    const enabled = Number(req.body.enabled)==="1" || Number(req.body.enabled)===1 ? 1 : 0;
+    const enabled = String(req.body.enabled)==="1" ? 1 : 0;
     const r = await run("UPDATE backends SET enabled=? WHERE id=?", [enabled, id]);
     if(r.changes===0) throw new Error("backend 不存在");
     await audit(req.session.user.username,"backend.toggle",{id, enabled});
@@ -530,7 +533,7 @@ app.post(ENTRY + "/admin/backends/test", mustAdmin, csrfProtection, async (req,r
   }
 });
 
-/** ---- Admin: users (independent) ---- */
+/** ---- Admin users ---- */
 app.get(ENTRY + "/admin/users", mustAdmin, csrfProtection, async (req,res)=>{
   const users = await all("SELECT id,username,role,enabled,created_at FROM users ORDER BY id DESC");
   const body = `
@@ -620,7 +623,7 @@ app.post(ENTRY + "/admin/users/reset", mustAdmin, csrfProtection, async (req,res
 app.post(ENTRY + "/admin/users/toggle", mustAdmin, csrfProtection, async (req,res)=>{
   try{
     const username = String(req.body.username||"").trim();
-    const enabled = Number(req.body.enabled)===1 || String(req.body.enabled)==="1" ? 1 : 0;
+    const enabled = String(req.body.enabled)==="1" ? 1 : 0;
     const r = await run("UPDATE users SET enabled=? WHERE username=?", [enabled, username]);
     if(r.changes===0) throw new Error("user not found");
     await audit(req.session.user.username,"user.toggle",{username, enabled});
@@ -630,7 +633,7 @@ app.post(ENTRY + "/admin/users/toggle", mustAdmin, csrfProtection, async (req,re
   }
 });
 
-/** ---- Admin: nodes/instances (requires backend but page still loads) ---- */
+/** ---- Admin nodes/instances ---- */
 app.get(ENTRY + "/admin/nodes", mustAdmin, csrfProtection, async (req,res)=>{
   let b = await pickDefaultBackend();
   let bannerHtml = "";
@@ -841,9 +844,10 @@ app.post(ENTRY + "/admin/raw", mustAdmin, csrfProtection, async (req,res)=>{
   }
 });
 
-/** ---- User portal ---- */
+/** ---- User portal ----
+ * FIX #2: 用户端“预设按钮化”，不允许手填（图3问题）
+ */
 async function userDefaultBackendForOps(){
-  // 用户端操作也使用默认后端（并通过 assignments 限制）
   return await pickDefaultBackend();
 }
 
@@ -872,66 +876,82 @@ app.get(ENTRY + "/user/instances", mustUser, csrfProtection, async (req,res)=>{
   ) : [];
 
   const list = asg.map(x=>`<option value="${esc(x.node_id)}::${esc(x.instance_name)}">${esc(x.node_id)} / ${esc(x.instance_name)}</option>`).join("");
+
+  const preset = cfg.user_presets || {};
+  const limitsPreset = preset.limits || {};
+  const reinstallImage = preset.reinstall_image || "images:debian/12";
+
   const body = `
-    <div class="muted">用户端只操作管理员分配的容器。默认后端：${b ? `<b>${esc(b.name)}</b>` : `<b>未配置</b>`}</div>
+    <div class="muted">用户端仅允许“预设操作 + 端口管理”。默认后端：${b ? `<b>${esc(b.name)}</b>` : `<b>未配置</b>`}</div>
 
     <label>选择容器</label>
     <select id="pick">${list || `<option value="">(暂无分配)</option>`}</select>
 
     <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
 
-    <form method="POST" action="${ENTRY}/user/action">
-      <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
-      <label>动作</label>
-      <select name="action">
-        <option value="list_ports">查看端口池</option>
-        <option value="add_port">添加端口映射</option>
-        <option value="del_port">删除端口映射</option>
-        <option value="set_limits">设置限制（含带宽）</option>
-        <option value="reinstall">重装（危险）</option>
-        <option value="create_user">容器内创建用户</option>
-      </select>
+    <div class="grid2">
+      <form method="POST" action="${ENTRY}/user/action">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <input type="hidden" name="pick" id="pickHidden1"/>
+        <input type="hidden" name="action" value="list_ports"/>
+        <button class="primary" type="submit">查看端口池</button>
+      </form>
 
-      <div class="grid2">
-        <div><label>删除映射：host_port</label><input name="host_port" placeholder="20001"/></div>
-        <div><label>添加映射：container_port</label><input name="container_port" placeholder="22"/></div>
-      </div>
-      <div class="grid2">
-        <div><label>proto</label><select name="proto"><option value="tcp">tcp</option><option value="udp">udp</option></select></div>
-        <div><label>指定宿主机端口（可空=自动分配）</label><input name="host_port_add" placeholder="2222"/></div>
-      </div>
+      <form method="POST" action="${ENTRY}/user/action">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <input type="hidden" name="pick" id="pickHidden2"/>
+        <input type="hidden" name="action" value="set_limits_preset"/>
+        <button class="good" type="submit">应用资源/带宽预设</button>
+      </form>
+    </div>
 
-      <div class="grid3">
-        <div><label>CPU 核心</label><input name="cpu_cores" placeholder="2"/></div>
-        <div><label>CPU 上限%</label><input name="cpu_limit_percent" placeholder="50"/></div>
-        <div><label>内存MB</label><input name="memory_mb" placeholder="2048"/></div>
-      </div>
-      <div class="grid3">
-        <div><label>磁盘GB</label><input name="disk_gb" placeholder="20"/></div>
-        <div><label>上行Mbit</label><input name="up_mbit" placeholder="50"/></div>
-        <div><label>下行Mbit</label><input name="down_mbit" placeholder="200"/></div>
-      </div>
+    <div class="grid2" style="margin-top:10px">
+      <form method="POST" action="${ENTRY}/user/action">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <input type="hidden" name="pick" id="pickHidden3"/>
+        <input type="hidden" name="action" value="reinstall_preset"/>
+        <button class="bad" type="submit">按预设重装系统</button>
+        <div class="muted" style="margin-top:8px">重装镜像：<b>${esc(reinstallImage)}</b></div>
+      </form>
 
-      <div class="grid2">
-        <div><label>重装镜像</label><input name="image" value="images:debian/12"/></div>
-        <div><label>保留端口/限制</label>
-          <select name="preserve"><option value="1" selected>保留</option><option value="0">不保留</option></select>
-        </div>
-      </div>
+      <div class="card" style="border-radius:14px"><h2>预设详情（只读）</h2><div class="body">
+        <pre>${esc(JSON.stringify({ limitsPreset, reinstallImage }, null, 2))}</pre>
+      </div></div>
+    </div>
 
-      <div class="grid2">
-        <div><label>容器内用户名</label><input name="linux_user" placeholder="alice"/></div>
-        <div><label>容器内密码（可空）</label><input name="linux_pass" placeholder="optional"/></div>
-      </div>
-      <label>SSH 公钥（可空）</label><textarea name="ssh_key" placeholder="ssh-ed25519 AAAA..."></textarea>
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+    <h3 style="margin:0 0 8px;font-size:13px">端口操作（只允许端口输入）</h3>
 
-      <input type="hidden" name="pick" id="pickHidden"/>
-      <div style="margin-top:12px"><button class="primary" type="submit">执行</button></div>
-    </form>
+    <div class="grid2">
+      <form method="POST" action="${ENTRY}/user/action">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <input type="hidden" name="pick" id="pickHidden4"/>
+        <input type="hidden" name="action" value="add_port"/>
+        <label>container_port</label><input name="container_port" placeholder="22" required/>
+        <label>proto</label><select name="proto"><option value="tcp">tcp</option><option value="udp">udp</option></select>
+        <label>指定宿主机端口（可空=自动分配）</label><input name="host_port_add" placeholder="2222"/>
+        <div style="margin-top:10px"><button class="good" type="submit">添加端口映射</button></div>
+      </form>
+
+      <form method="POST" action="${ENTRY}/user/action">
+        <input type="hidden" name="_csrf" value="${req.csrfToken()}"/>
+        <input type="hidden" name="pick" id="pickHidden5"/>
+        <input type="hidden" name="action" value="del_port"/>
+        <label>host_port</label><input name="host_port" placeholder="20001" required/>
+        <div style="margin-top:10px"><button class="bad" type="submit">删除端口映射</button></div>
+      </form>
+    </div>
 
     <script>
-      const s=document.getElementById("pick"); const h=document.getElementById("pickHidden");
-      function sync(){ h.value=s.value; } sync(); s.addEventListener("change",sync);
+      const s=document.getElementById("pick");
+      function sync(){
+        const v=s.value;
+        ["1","2","3","4","5"].forEach(n=>{
+          const el=document.getElementById("pickHidden"+n);
+          if(el) el.value=v;
+        });
+      }
+      sync(); s.addEventListener("change",sync);
     </script>
   `;
   res.send(layout("我的容器", me, body, bannerHtml));
@@ -957,8 +977,10 @@ app.post(ENTRY + "/user/action", mustUser, csrfProtection, async (req,res)=>{
     const num = (k)=>{ const v=Number(req.body[k]); return Number.isFinite(v)&&v>0?v:null; };
 
     let r=null;
+
     if(action==="list_ports"){
       r = await backendFetch(b, "GET", `/nodes/${encodeURIComponent(node_id)}/ports`);
+
     }else if(action==="add_port"){
       const cp=num("container_port"); if(!cp) throw new Error("container_port 必填");
       const proto=String(req.body.proto||"tcp");
@@ -966,33 +988,29 @@ app.post(ENTRY + "/user/action", mustUser, csrfProtection, async (req,res)=>{
       const payload={ container_port: cp, proto };
       if(hp) payload.host_port=hp;
       r = await backendFetch(b, "POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/ports`, payload);
+
     }else if(action==="del_port"){
       const hp=num("host_port"); if(!hp) throw new Error("host_port 必填");
       r = await backendFetch(b, "DELETE", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/ports/${hp}`);
-    }else if(action==="set_limits"){
-      const payload={};
-      const cpu=num("cpu_cores"); if(cpu) payload.cpu_cores=cpu;
-      const cpuPct=num("cpu_limit_percent"); if(cpuPct) payload.cpu_limit_percent=cpuPct;
-      const mem=num("memory_mb"); if(mem) payload.memory_mb=mem;
-      const disk=num("disk_gb"); if(disk) payload.disk_gb=disk;
-      const up=num("up_mbit"); if(up) payload.up_mbit=up;
-      const down=num("down_mbit"); if(down) payload.down_mbit=down;
-      if(Object.keys(payload).length===0) throw new Error("至少填一个限制项");
-      r = await backendFetch(b, "POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/limits`, payload);
-    }else if(action==="reinstall"){
-      const image=String(req.body.image||"").trim(); if(!image) throw new Error("image 必填");
-      const preserve=String(req.body.preserve||"1")==="1";
-      r = await backendFetch(b, "POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/reinstall`, {
-        image, preserve_ports: preserve, preserve_limits: preserve
-      });
-    }else if(action==="create_user"){
-      const username=String(req.body.linux_user||"").trim(); if(!username) throw new Error("linux_user 必填");
-      const payload={ username, sudo:true };
-      const pw=String(req.body.linux_pass||"").trim(); if(pw) payload.password=pw;
-      const key=String(req.body.ssh_key||"").trim(); if(key) payload.ssh_public_key=key;
-      r = await backendFetch(b, "POST", `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/users`, payload);
+
+    }else if(action==="set_limits_preset"){
+      const preset = cfg.user_presets?.limits || {};
+      if(Object.keys(preset).length===0) throw new Error("管理员未配置 user_presets.limits");
+      r = await backendFetch(b, "POST",
+        `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/limits`,
+        preset
+      );
+
+    }else if(action==="reinstall_preset"){
+      const image = cfg.user_presets?.reinstall_image;
+      if(!image) throw new Error("管理员未配置 user_presets.reinstall_image");
+      r = await backendFetch(b, "POST",
+        `/nodes/${encodeURIComponent(node_id)}/instances/${encodeURIComponent(instance_name)}/reinstall`,
+        { image, preserve_ports: true, preserve_limits: true }
+      );
+
     }else{
-      throw new Error("未知 action");
+      throw new Error("不允许的 action");
     }
 
     await audit(me.username,"user.action",{backend_id:b.id,node_id,instance_name,action});
@@ -1058,6 +1076,9 @@ app.get(ENTRY + "/health", async (req,res)=>{
   res.json({ ok:true, service:"lxd-3xui-panel", entry:ENTRY, backend_default: b?{id:b.id,name:b.name,base_url:b.base_url}:null, backend_health: backend });
 });
 
+/** ---- FIX #1(b): 任何未知路径都跳到登录页，避免“白屏”体验 ---- */
+app.use((req,res)=>res.redirect(ENTRY + "/login"));
+
 /** ---- boot ---- */
 await initDb();
 
@@ -1084,6 +1105,7 @@ write_config(){
   local admin_pass="$(rand_pw 18)"
   local session_secret="$(rand_pw 32)"
 
+  # 用户端预设：不可编辑（你后面想改预设，改这里即可）
   cat > "$CFG_DIR/config.json" <<EOF
 {
   "listen_port": ${PORT},
@@ -1091,7 +1113,11 @@ write_config(){
   "admin_user": "${admin_user}",
   "admin_pass": "${admin_pass}",
   "session_secret": "${session_secret}",
-  "public_host": ""
+  "public_host": "",
+  "user_presets": {
+    "limits": { "cpu_cores": 2, "cpu_limit_percent": 50, "memory_mb": 2048, "disk_gb": 20, "up_mbit": 50, "down_mbit": 200 },
+    "reinstall_image": "images:debian/12"
+  }
 }
 EOF
   chmod 600 "$CFG_DIR/config.json"
@@ -1147,10 +1173,10 @@ show_result(){
   echo -e "管理员密码：${YELLOW}${admin_pass}${PLAIN}"
   echo -e "${GREEN}=============================================================${PLAIN}"
   echo
-  echo -e "${YELLOW}下一步（不需要后端也能先登录）：${PLAIN}"
-  echo -e "1) 先用管理员登录"
-  echo -e "2) 进入【后端连接】添加 Panel URL + admin 密码（可选，后装也行）"
-  echo -e "3) 进入【用户管理】创建用户并分配容器"
+  echo -e "${YELLOW}说明：${PLAIN}"
+  echo -e "1) 未配置后端时也能登录/创建用户/分配映射。"
+  echo -e "2) 管理员登录后去【后端连接】添加 Panel Base URL + admin 密码，即可启用节点/容器功能。"
+  echo -e "3) 用户端页面为“预设按钮化”，不允许手填资源参数。预设在 ${CFG_DIR}/config.json 的 user_presets 中改。"
   echo
 }
 
