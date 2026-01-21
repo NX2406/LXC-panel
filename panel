@@ -1,0 +1,720 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================
+# LXD Control Panel - 一键部署脚本
+# 集成：FastAPI 后端 + 原生 HTML 前端 + Nginx 反代 + Systemd
+# ==============================================================
+
+# 配置路径
+APP_DIR="/opt/lxd-panel"
+BACKEND_DIR="${APP_DIR}/backend"
+FRONTEND_DIR="${APP_DIR}/frontend"
+DATA_DIR="${APP_DIR}/data"
+CERT_CACHE="${APP_DIR}/cert-cache"
+LOG_DIR="/var/log/lxd-panel"
+PY_VENV="${BACKEND_DIR}/.venv"
+API_PORT="8089"
+
+# 颜色
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+echo -e "${GREEN}[1/7] 安装系统依赖...${NC}"
+apt-get update -qq
+apt-get install -y -qq curl nginx python3 python3-venv python3-pip jq openssl
+
+echo -e "${GREEN}[2/7] 初始化目录结构...${NC}"
+mkdir -p "${BACKEND_DIR}" "${FRONTEND_DIR}" "${DATA_DIR}" "${CERT_CACHE}" "${LOG_DIR}"
+chmod 700 "${CERT_CACHE}" || true
+
+echo -e "${GREEN}[3/7] 写入后端代码 (FastAPI)...${NC}"
+
+# 1. requirements.txt
+cat > "${BACKEND_DIR}/requirements.txt" <<'REQ_EOF'
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-jose==3.3.0
+passlib[bcrypt]==1.7.4
+pydantic==2.8.2
+httpx==0.27.2
+REQ_EOF
+
+# 2. app.py
+cat > "${BACKEND_DIR}/app.py" <<'PY_EOF'
+import os, re, time, sqlite3, base64, json
+from typing import Optional, List, Dict, Any
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from pydantic import BaseModel
+
+APP_NAME = "LXD-Panel"
+DB_PATH = os.environ.get("LXD_PANEL_DB", "/opt/lxd-panel/data/panel.db")
+JWT_SECRET = os.environ.get("LXD_PANEL_JWT_SECRET", "PLEASE_CHANGE_ME")
+CERT_CACHE = os.environ.get("LXD_PANEL_CERT_CACHE", "/opt/lxd-panel/cert-cache")
+JWT_ALG = "HS256"
+TOKEN_TTL_SECONDS = 12 * 3600
+
+ALLOWED_IMAGES = [
+    "images:ubuntu/22.04",
+    "images:ubuntu/24.04",
+    "images:debian/12",
+]
+
+NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{1,30}$")
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user',
+      created_at INTEGER NOT NULL
+    );
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS nodes(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      base_url TEXT NOT NULL,
+      panel_key TEXT NOT NULL,
+      ca_pem TEXT NOT NULL,
+      client_cert_pem TEXT NOT NULL,
+      client_key_pem TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+    """)
+    conn.commit()
+
+    cur.execute("SELECT id FROM users WHERE username='admin'")
+    if not cur.fetchone():
+        cur.execute(
+            "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+            ("admin", pwd_ctx.hash("ChangeMeNow!"), "admin", int(time.time()))
+        )
+        conn.commit()
+    conn.close()
+
+def make_token(user: Dict[str, Any]) -> str:
+    payload = {
+        "sub": user["username"],
+        "role": user["role"],
+        "uid": user["id"],
+        "exp": int(time.time()) + TOKEN_TTL_SECONDS
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+def parse_token(token: str) -> Dict[str, Any]:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def current_user(req: Request) -> Dict[str, Any]:
+    auth = req.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing token")
+    return parse_token(auth.split(" ", 1)[1].strip())
+
+def require_admin(user=Depends(current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+def ensure_short_name(short: str):
+    if not NAME_RE.match(short):
+        raise HTTPException(status_code=400, detail="Invalid name. Use letters/numbers/dash, 2-31 chars.")
+
+def user_prefix(user: Dict[str, Any]) -> str:
+    return f"u_{user['uid']}_"
+
+def full_name(user: Dict[str, Any], short: str) -> str:
+    return user_prefix(user) + short
+
+def get_node(node_id: int) -> sqlite3.Row:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM nodes WHERE id=?", (node_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="node not found")
+    return row
+
+def _write_cert_files(node: sqlite3.Row) -> Dict[str, str]:
+    os.makedirs(CERT_CACHE, exist_ok=True)
+    ca_path = os.path.join(CERT_CACHE, f"node{node['id']}.ca.pem")
+    crt_path = os.path.join(CERT_CACHE, f"node{node['id']}.client.crt.pem")
+    key_path = os.path.join(CERT_CACHE, f"node{node['id']}.client.key.pem")
+
+    def write_if_changed(path: str, content: str, mode: int):
+        old = None
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                old = f.read()
+        if old != content:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(path, mode)
+
+    write_if_changed(ca_path, node["ca_pem"], 0o644)
+    write_if_changed(crt_path, node["client_cert_pem"], 0o644)
+    write_if_changed(key_path, node["client_key_pem"], 0o600)
+
+    return {"ca": ca_path, "crt": crt_path, "key": key_path}
+
+async def agent_call(node: sqlite3.Row, method: str, path: str, json_body: Optional[dict]=None) -> dict:
+    url = node["base_url"].rstrip("/") + path
+    headers = {"X-Panel-Key": node["panel_key"]}
+    files = _write_cert_files(node)
+
+    timeout = httpx.Timeout(20.0, read=180.0)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        verify=files["ca"],
+        cert=(files["crt"], files["key"])
+    ) as client:
+        r = await client.request(method, url, headers=headers, json=json_body)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"detail": r.text}
+        if r.status_code >= 400:
+            raise HTTPException(status_code=r.status_code, detail=data.get("detail", data))
+        return data
+
+class LoginReq(BaseModel):
+    username: str
+    password: str
+
+class CreateUserReq(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+class AddNodeBundleReq(BaseModel):
+    bundle_b64: str
+
+class CreateContainerReq(BaseModel):
+    node_id: int
+    name: str
+    image: str
+    cpu: int = 1
+    memory_mb: int = 512
+    disk_gb: int = 8
+    ingress_mbit: Optional[int] = None
+    egress_mbit: Optional[int] = None
+
+class ExecReq(BaseModel):
+    node_id: int
+    name: str
+    cmd: List[str]
+
+class NodeOpReq(BaseModel):
+    node_id: int
+    name: str
+
+app = FastAPI(title=APP_NAME)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def _startup():
+    init_db()
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "app": APP_NAME}
+
+@app.post("/api/login")
+def login(body: LoginReq):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username=?", (body.username,))
+    row = cur.fetchone()
+    conn.close()
+    if not row or not pwd_ctx.verify(body.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Bad credentials")
+    token = make_token({"id": row["id"], "username": row["username"], "role": row["role"]})
+    return {"token": token, "role": row["role"], "username": row["username"]}
+
+@app.get("/api/me")
+def me(user=Depends(current_user)):
+    return {"username": user["sub"], "role": user["role"], "uid": user["uid"]}
+
+@app.get("/api/images")
+def images(user=Depends(current_user)):
+    return {"items": ALLOWED_IMAGES}
+
+@app.post("/api/admin/users")
+def admin_create_user(body: CreateUserReq, admin=Depends(require_admin)):
+    if body.role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="role must be admin/user")
+    conn = db()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users(username,password_hash,role,created_at) VALUES(?,?,?,?)",
+            (body.username, pwd_ctx.hash(body.password), body.role, int(time.time()))
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="username exists")
+    finally:
+        conn.close()
+    return {"ok": True}
+
+@app.post("/api/admin/nodes/bundle")
+async def admin_add_node_bundle(body: AddNodeBundleReq, admin=Depends(require_admin)):
+    try:
+        raw = base64.b64decode(body.bundle_b64.strip()).decode("utf-8", "ignore")
+        j = json.loads(raw)
+        name = str(j["name"])
+        base_url = str(j["base_url"]).rstrip("/")
+        panel_key = str(j["panel_key"]).strip()
+        ca_pem = str(j["ca_pem"])
+        client_cert_pem = str(j["client_cert_pem"])
+        client_key_pem = str(j["client_key_pem"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid bundle")
+
+    if not base_url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="base_url must be https://...")
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO nodes(name,base_url,panel_key,ca_pem,client_cert_pem,client_key_pem,created_at) VALUES(?,?,?,?,?,?,?)",
+        (name, base_url, panel_key, ca_pem, client_cert_pem, client_key_pem, int(time.time()))
+    )
+    conn.commit()
+    node_id = cur.lastrowid
+    conn.close()
+
+    # 立即健康检查
+    node = get_node(node_id)
+    await agent_call(node, "GET", "/agent/health")
+
+    return {"ok": True, "node_id": node_id}
+
+@app.get("/api/nodes")
+def list_nodes(user=Depends(current_user)):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT id,name,base_url,created_at FROM nodes ORDER BY id DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return {"items": rows}
+
+@app.get("/api/containers")
+async def containers(node_id: int, user=Depends(current_user)):
+    node = get_node(node_id)
+    data = await agent_call(node, "GET", "/agent/containers")
+    items = data.get("items", [])
+    if user.get("role") == "admin":
+        return {"items": items}
+    pref = user_prefix(user)
+    return {"items": [x for x in items if (x.get("name","").startswith(pref))]}
+
+@app.post("/api/containers")
+async def create_container(body: CreateContainerReq, user=Depends(current_user)):
+    ensure_short_name(body.name)
+    if body.image not in ALLOWED_IMAGES and user.get("role") != "admin":
+        raise HTTPException(status_code=400, detail=f"image not allowed. allowed={ALLOWED_IMAGES}")
+
+    node = get_node(body.node_id)
+    cname = full_name(user, body.name)
+
+    payload = {
+        "name": cname,
+        "image": body.image,
+        "cpu": body.cpu,
+        "memory_mb": body.memory_mb,
+        "disk_gb": body.disk_gb,
+        "ingress_mbit": body.ingress_mbit,
+        "egress_mbit": body.egress_mbit,
+        "autostart": True
+    }
+    data = await agent_call(node, "POST", "/agent/containers", json_body=payload)
+    return {"ok": True, "name": data.get("name", cname)}
+
+def owned_name(user: Dict[str, Any], short: str) -> str:
+    ensure_short_name(short)
+    return full_name(user, short)
+
+@app.post("/api/containers/start")
+async def start(body: NodeOpReq, user=Depends(current_user)):
+    node = get_node(body.node_id)
+    await agent_call(node, "POST", f"/agent/containers/{owned_name(user, body.name)}/start")
+    return {"ok": True}
+
+@app.post("/api/containers/stop")
+async def stop(body: NodeOpReq, user=Depends(current_user)):
+    node = get_node(body.node_id)
+    await agent_call(node, "POST", f"/agent/containers/{owned_name(user, body.name)}/stop")
+    return {"ok": True}
+
+@app.post("/api/containers/restart")
+async def restart(body: NodeOpReq, user=Depends(current_user)):
+    node = get_node(body.node_id)
+    await agent_call(node, "POST", f"/agent/containers/{owned_name(user, body.name)}/restart")
+    return {"ok": True}
+
+@app.post("/api/containers/delete")
+async def delete(body: NodeOpReq, user=Depends(current_user)):
+    node = get_node(body.node_id)
+    await agent_call(node, "DELETE", f"/agent/containers/{owned_name(user, body.name)}")
+    return {"ok": True}
+
+@app.post("/api/containers/exec")
+async def exec_cmd(body: ExecReq, user=Depends(current_user)):
+    node = get_node(body.node_id)
+    data = await agent_call(node, "POST", f"/agent/containers/{owned_name(user, body.name)}/exec", json_body={"cmd": body.cmd})
+    return {"ok": True, "output": data.get("output","")}
+PY_EOF
+
+echo -e "${GREEN}[4/7] 写入前端代码 (HTML)...${NC}"
+cat > "${FRONTEND_DIR}/index.html" <<'HTML_EOF'
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>LXD Panel (Secure)</title>
+<style>
+  body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto;margin:0;background:#0b0f17;color:#e6edf3}
+  .wrap{max-width:1200px;margin:0 auto;padding:24px}
+  .card{background:#111827;border:1px solid #1f2937;border-radius:14px;padding:16px;margin:14px 0;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+  input,select,button,textarea{background:#0b1220;border:1px solid #233047;color:#e6edf3;padding:10px 12px;border-radius:10px}
+  textarea{min-height:110px;width:100%}
+  button{cursor:pointer}
+  button.primary{background:#1d4ed8;border-color:#1d4ed8}
+  button.danger{background:#b91c1c;border-color:#b91c1c}
+  button.ghost{background:transparent}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .grow{flex:1}
+  .muted{color:#9ca3af}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{border-bottom:1px solid #22304a;padding:10px 8px;text-align:left}
+  .badge{padding:3px 9px;border-radius:999px;border:1px solid #2b3a55;font-size:12px}
+  .ok{border-color:#14532d;color:#86efac}
+  .warn{border-color:#7c2d12;color:#fdba74}
+  pre{white-space:pre-wrap;background:#0b1220;border:1px solid #233047;padding:12px;border-radius:10px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row" style="justify-content:space-between">
+    <div>
+      <div style="font-weight:800">🛡️ LXD Panel <span class="muted" style="font-size:12px">mTLS + Key</span></div>
+      <div class="muted" id="who">未登录</div>
+    </div>
+    <div class="row"><button class="ghost" onclick="logout()">退出</button></div>
+  </div>
+
+  <div class="card" id="loginCard">
+    <h3>登录</h3>
+    <div class="row">
+      <input id="u" value="admin" placeholder="用户名"/>
+      <input id="p" value="ChangeMeNow!" type="password" placeholder="密码"/>
+      <button class="primary" onclick="login()">登录</button>
+    </div>
+    <div class="muted" id="loginMsg"></div>
+  </div>
+
+  <div class="card" id="nodeCard" style="display:none">
+    <div class="row" style="justify-content:space-between">
+      <h3 style="margin:0">节点（Agent）</h3>
+      <button onclick="loadNodes()">刷新</button>
+    </div>
+
+    <div class="row">
+      <select id="nodeSel" onchange="refreshContainers()"></select>
+      <span class="muted">所有指令通过 Panel 转发到 Agent（https + mTLS + key）。</span>
+    </div>
+
+    <div id="adminBox" style="display:none; margin-top:12px">
+      <h4>添加节点（管理员）</h4>
+      <div class="muted">把宿主机脚本输出的 Node Bundle（base64）粘贴进来：</div>
+      <textarea id="bundle" placeholder="粘贴 base64..."></textarea>
+      <div class="row">
+        <button class="primary" onclick="addNodeBundle()">添加并健康检查</button>
+        <span class="muted" id="nodeMsg"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" id="createCard" style="display:none">
+    <h3>创建容器</h3>
+    <div class="row">
+      <input id="cname" placeholder="短名：web-01"/>
+      <select id="image"></select>
+      <input id="cpu" type="number" min="1" max="64" value="1" placeholder="CPU"/>
+      <input id="mem" type="number" min="128" value="512" placeholder="内存(MB)"/>
+      <input id="disk" type="number" min="4" value="8" placeholder="磁盘(GB)"/>
+      <input id="ing" type="number" min="1" placeholder="入站限速(Mbit，可空)"/>
+      <input id="eg" type="number" min="1" placeholder="出站限速(Mbit，可空)"/>
+      <button class="primary" onclick="createContainer()">创建</button>
+    </div>
+    <div class="muted" id="createMsg"></div>
+  </div>
+
+  <div class="card" id="listCard" style="display:none">
+    <div class="row" style="justify-content:space-between">
+      <h3 style="margin:0">容器列表</h3>
+      <button onclick="refreshContainers()">刷新</button>
+    </div>
+    <table>
+      <thead><tr><th>短名</th><th>状态</th><th>IPv4</th><th>操作</th></tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+
+    <h4>执行命令（非交互）</h4>
+    <div class="row">
+      <input id="execName" placeholder="短名：web-01"/>
+      <input id="execCmd" class="grow" placeholder="命令：uname -a"/>
+      <button onclick="execCmdGo()">执行</button>
+    </div>
+    <pre id="execOut" class="muted">输出显示在这里</pre>
+  </div>
+</div>
+
+<script>
+const API="/api";
+let token=localStorage.getItem("token")||"";
+let me=null;
+
+function h(){ return token ? {"Authorization":"Bearer "+token} : {}; }
+function msg(id,t){ document.getElementById(id).innerText=t||""; }
+
+async function login(){
+  msg("loginMsg","登录中...");
+  const r=await fetch(API+"/login",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({username:u.value.trim(),password:p.value})});
+  const j=await r.json();
+  if(!r.ok){ msg("loginMsg", j.detail||"登录失败"); return; }
+  token=j.token; localStorage.setItem("token",token);
+  await boot();
+}
+
+function logout(){ token=""; localStorage.removeItem("token"); location.reload(); }
+
+async function boot(){
+  const r=await fetch(API+"/me",{headers:h()});
+  if(!r.ok){ logout(); return; }
+  me=await r.json();
+  who.innerText=`已登录：${me.username}（${me.role}） uid=${me.uid}`;
+  loginCard.style.display="none";
+  nodeCard.style.display="";
+  createCard.style.display="";
+  listCard.style.display="";
+  adminBox.style.display = (me.role==="admin") ? "" : "none";
+
+  const ir=await fetch(API+"/images",{headers:h()});
+  const ij=await ir.json();
+  image.innerHTML="";
+  (ij.items||[]).forEach(x=>{ const o=document.createElement("option"); o.value=x; o.textContent=x; image.appendChild(o); });
+
+  await loadNodes();
+}
+
+async function addNodeBundle(){
+  msg("nodeMsg","添加中...");
+  const b=bundle.value.trim();
+  const r=await fetch(API+"/admin/nodes/bundle",{method:"POST",headers:{"Content-Type":"application/json",...h()},body:JSON.stringify({bundle_b64:b})});
+  const j=await r.json();
+  if(!r.ok){ msg("nodeMsg", j.detail||"添加失败"); return; }
+  msg("nodeMsg", `添加成功 ✅ node_id=${j.node_id}`);
+  bundle.value="";
+  await loadNodes();
+}
+
+async function loadNodes(){
+  const r=await fetch(API+"/nodes",{headers:h()});
+  const j=await r.json();
+  nodeSel.innerHTML="";
+  (j.items||[]).forEach(n=>{
+    const o=document.createElement("option");
+    o.value=n.id; o.textContent=`#${n.id} ${n.name} (${n.base_url})`;
+    nodeSel.appendChild(o);
+  });
+  if((j.items||[]).length===0){
+    tbody.innerHTML="";
+    return;
+  }
+  await refreshContainers();
+}
+
+function nodeId(){ return parseInt(nodeSel.value||"0",10); }
+
+function badge(s){
+  s=(s||"").toLowerCase();
+  if(s==="running") return `<span class="badge ok">running</span>`;
+  if(s==="stopped") return `<span class="badge warn">stopped</span>`;
+  return `<span class="badge">${s}</span>`;
+}
+
+async function refreshContainers(){
+  const nid=nodeId();
+  if(!nid) return;
+  const r=await fetch(API+`/containers?node_id=${nid}`,{headers:h()});
+  const j=await r.json();
+  tbody.innerHTML="";
+  (j.items||[]).forEach(it=>{
+    const full=it.name||"";
+    const short=full.replace(/^u_\d+_/,"");
+    const tr=document.createElement("tr");
+    tr.innerHTML=`
+      <td>${short}<div class="muted" style="font-size:12px">${full}</div></td>
+      <td>${badge(it.status)}</td>
+      <td>${it.ipv4||"-"}</td>
+      <td class="row">
+        <button onclick="op('${short}','start')">start</button>
+        <button onclick="op('${short}','stop')">stop</button>
+        <button onclick="op('${short}','restart')">restart</button>
+        <button class="danger" onclick="op('${short}','delete')">delete</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+async function op(name, action){
+  const nid=nodeId();
+  if(!nid) return;
+  if(action==="delete" && !confirm("确定删除？这会强制删除容器。")) return;
+  const r=await fetch(API+`/containers/${action}`,{method:"POST",headers:{"Content-Type":"application/json",...h()},
+    body:JSON.stringify({node_id:nid,name})});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok){ alert(j.detail||"操作失败"); return; }
+  await refreshContainers();
+}
+
+async function createContainer(){
+  const nid=nodeId();
+  if(!nid){ msg("createMsg","请先选择节点"); return; }
+  msg("createMsg","创建中（首次拉镜像可能较慢）...");
+  const body={node_id:nid,name:cname.value.trim(),image:image.value,
+    cpu:parseInt(cpu.value||"1",10),memory_mb:parseInt(mem.value||"512",10),disk_gb:parseInt(disk.value||"8",10)};
+  if(ing.value.trim()) body.ingress_mbit=parseInt(ing.value.trim(),10);
+  if(eg.value.trim()) body.egress_mbit=parseInt(eg.value.trim(),10);
+
+  const r=await fetch(API+"/containers",{method:"POST",headers:{"Content-Type":"application/json",...h()},body:JSON.stringify(body)});
+  const j=await r.json();
+  if(!r.ok){ msg("createMsg", j.detail||"创建失败"); return; }
+  msg("createMsg","创建成功 ✅");
+  await refreshContainers();
+}
+
+async function execCmdGo(){
+  const nid=nodeId();
+  const name=execName.value.trim();
+  const cmdLine=execCmd.value.trim();
+  if(!nid||!name||!cmdLine){ alert("节点、短名、命令都要填"); return; }
+  execOut.innerText="执行中...";
+  const r=await fetch(API+"/containers/exec",{method:"POST",headers:{"Content-Type":"application/json",...h()},
+    body:JSON.stringify({node_id:nid,name,cmd:cmdLine.split(" ").filter(Boolean)})});
+  const j=await r.json();
+  if(!r.ok){ execOut.innerText=j.detail||"执行失败"; return; }
+  execOut.innerText=j.output||"";
+}
+
+if(token) boot();
+</script>
+</body>
+</html>
+HTML_EOF
+
+echo -e "${GREEN}[5/7] 安装 Python 环境 & 依赖...${NC}"
+python3 -m venv "${PY_VENV}"
+"${PY_VENV}/bin/pip" install --upgrade pip >/dev/null
+"${PY_VENV}/bin/pip" install -r "${BACKEND_DIR}/requirements.txt" >/dev/null
+
+echo -e "${GREEN}[6/7] 配置 Systemd & Nginx...${NC}"
+
+# 生成 JWT Secret
+JWT_SECRET=$(openssl rand -hex 32)
+
+# Systemd Service
+cat > /etc/systemd/system/lxd-panel.service <<EOF
+[Unit]
+Description=LXD Panel Backend
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${BACKEND_DIR}
+Environment="LXD_PANEL_DB=${DATA_DIR}/panel.db"
+Environment="LXD_PANEL_CERT_CACHE=${CERT_CACHE}"
+Environment="LXD_PANEL_JWT_SECRET=${JWT_SECRET}"
+ExecStart=${PY_VENV}/bin/uvicorn app:app --host 127.0.0.1 --port ${API_PORT}
+Restart=always
+RestartSec=2
+StandardOutput=append:${LOG_DIR}/panel.log
+StandardError=append:${LOG_DIR}/panel.err
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now lxd-panel.service
+
+# Nginx Config
+cat > /etc/nginx/sites-available/lxd-panel <<EOF
+server {
+  listen 80 default_server;
+  listen [::]:80 default_server;
+
+  root ${FRONTEND_DIR};
+  index index.html;
+
+  location / {
+    try_files \$uri \$uri/ /index.html;
+  }
+
+  location /api/ {
+    proxy_pass http://127.0.0.1:${API_PORT}/api/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  }
+}
+EOF
+
+rm -f /etc/nginx/sites-enabled/default || true
+ln -sf /etc/nginx/sites-available/lxd-panel /etc/nginx/sites-enabled/lxd-panel
+nginx -t >/dev/null 2>&1
+systemctl enable --now nginx
+systemctl restart nginx
+
+# 获取本机 IP
+HOST_IP=$(hostname -I | awk '{print $1}')
+
+echo -e "${GREEN}[7/7] 部署完成！${NC}"
+echo "------------------------------------------------------------"
+echo "✅ LXD Panel 已启动"
+echo "访问地址： http://${HOST_IP}/"
+echo "默认账号： admin"
+echo "默认密码： ChangeMeNow!"
+echo ""
+echo "👉 请立即登录并修改密码！"
+echo "------------------------------------------------------------"
