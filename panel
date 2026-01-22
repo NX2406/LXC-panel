@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# LXD 实例管理脚本 - 智能 Swap 增强版
-# 2025.11.16 Smart Swap
+# LXD 实例管理脚本 - 列表增强版 (显示NAT)
+# 2025.11.16 List Plus
 
 # --- 0. 启动反馈 ---
 echo "正在初始化脚本资源..."
@@ -11,7 +11,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 SKYBLUE='\033[0;36m'
 PLAIN='\033[0m'
-DIVIDER="${SKYBLUE}------------------------------------------------------${PLAIN}"
+DIVIDER="${SKYBLUE}------------------------------------------------------------------------${PLAIN}"
 
 # --- 1. 环境自检 ---
 
@@ -322,7 +322,7 @@ manage_single_instance() {
                 echo -e "${RED}警告: 数据将清空，保留IP/端口。${PLAIN}"
                 read -p "确认重装? (y/n): " confirm
                 if [ "$confirm" == "y" ]; then
-                    echo -e "选择系统: [1]Debian12 [2]Ubuntu22 [3]CentOS7"
+                    echo -e "选择系统: [1]Debian12 [2]Ubuntu22 [3]CentOS7 [4]Alpine3.19"
                     read -p "选择: " ros; 
                     case $ros in 
                         2) a="ubuntu"; b="22.04" ;; 
@@ -362,63 +362,15 @@ manage_all_menu() {
     read -p "回车返回..." d
 }
 
-# === 核心修改：智能 Swap 计算 ===
 add_host_swap() {
-    clear
-    echo -e "${GREEN}=== 宿主机 Swap 智能管理 ===${PLAIN}"
-    
-    # 1. 获取信息
-    mem_total=$(free -m | awk '/Mem:/ {print $2}')
+    clear; echo -e "${GREEN}宿主机 Swap${PLAIN}"
     current_swap=$(free -m | awk '/Swap/ {print $2}')
-    # 获取根目录可用空间
-    disk_avail=$(df -m / | awk 'NR==2 {print $4}')
-    
-    echo -e "物理内存: ${SKYBLUE}${mem_total} MB${PLAIN}"
-    echo -e "当前 Swap: ${SKYBLUE}${current_swap} MB${PLAIN}"
-    echo -e "可用硬盘: ${SKYBLUE}${disk_avail} MB${PLAIN}"
-    
-    # 2. 科学计算推荐值
-    # 基础策略：RAM < 4G 则 2xRAM；RAM > 4G 则 1xRAM 或封顶 4G
-    # 如果是小内存 VPS，Swap 救命很重要
-    rec_swap=$((mem_total * 2))
-    
-    # 如果内存大于 4G，Swap 不需要那么大，给 4G 足够
-    if [ "$mem_total" -gt 4096 ]; then
-        rec_swap=4096
-    fi
-    
-    # 3. 硬盘安全熔断：Swap 不能超过可用磁盘的 40%，防止爆盘
-    max_disk_limit=$((disk_avail * 40 / 100))
-    
-    if [ "$rec_swap" -gt "$max_disk_limit" ]; then
-        rec_swap=$max_disk_limit
-        echo -e "${YELLOW}提示: 硬盘空间有限，已自动下调推荐值至安全范围。${PLAIN}"
-    fi
-    
-    # 4. 交互
-    echo -e "${DIVIDER}"
-    echo -e "系统推荐增加: ${GREEN}${rec_swap} MB${PLAIN}"
-    read -p "请输入增加大小 (MB) [回车默认推荐值]: " swap_size
-    swap_size=${swap_size:-$rec_swap}
-    
-    if [ "$swap_size" -le 0 ]; then
-        echo "跳过。"
-        return
-    fi
-
-    # 5. 执行创建
-    echo -e "${YELLOW}正在创建 Swap 文件 (大小: ${swap_size}MB)...${PLAIN}"
+    echo -e "当前: ${SKYBLUE}${current_swap} MB${PLAIN}"
+    read -p "增加 (MB) [1024]: " swap_size; swap_size=${swap_size:-1024}
     dd if=/dev/zero of=/swapfile bs=1M count=$swap_size
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    if ! grep -q "/swapfile" /etc/fstab; then 
-        echo "/swapfile none swap sw 0 0" >> /etc/fstab
-    fi
-    
-    echo -e "${GREEN}Swap 创建成功!${PLAIN}"
-    free -m
-    read -p "回车返回..." d
+    chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile
+    if ! grep -q "/swapfile" /etc/fstab; then echo "/swapfile none swap sw 0 0" >> /etc/fstab; fi
+    echo -e "${GREEN}Swap 创建成功!${PLAIN}"; read -p "回车返回..." d
 }
 
 enable_bbr() {
@@ -430,22 +382,43 @@ enable_bbr() {
     echo -e "${GREEN}BBR 已开启${PLAIN}"; read -p "回车返回..." d
 }
 
+# === 列表增强函数 ===
 view_instances() {
     clear
     local names=$(lxc list --format csv -c n)
     if [ -z "$names" ]; then echo "无实例"; read -p "回车返回..." d; return; fi
-    printf "%-15s %-10s %-10s %-15s\n" "名称" "状态" "SSH端口" "Root密码"
+    
+    # 增加列宽适配 NAT
+    printf "%-12s %-10s %-9s %-15s %-15s\n" "名称" "状态" "SSH" "NAT映射" "Root密码"
     echo -e "${DIVIDER}"
+    
     for c in $names; do
         info=$(lxc list "$c" --format json)
         status=$(echo "$info" | jq -r '.[0].status')
         desc=$(lxc config get "$c" user.description 2>/dev/null)
         read -r -a d_arr <<< "$desc"
-        ssh_p="${d_arr[1]}"; pass="${d_arr[2]}"; [ -z "$ssh_p" ] && ssh_p="-"; [ -z "$pass" ] && pass="-"
-        [ "$status" == "Running" ] && color=$GREEN || color=$RED
-        printf "%-15s ${color}%-10s${PLAIN} %-10s %-15s\n" "$c" "$status" "$ssh_p" "$pass"
+        
+        # d_arr[0]=name, [1]=ssh, [2]=pass, [3]=nat1, [4]=nat2
+        ssh_p="${d_arr[1]}"
+        pass="${d_arr[2]}"
+        nat1="${d_arr[3]}"
+        nat2="${d_arr[4]}"
+        
+        [ -z "$ssh_p" ] && ssh_p="-"
+        [ -z "$pass" ] && pass="-"
+        
+        # 处理 NAT 显示逻辑
+        if [ -n "$nat1" ] && [ "$nat1" != "0" ]; then
+            nat_info="${nat1}-${nat2}"
+        else
+            nat_info="-"
+        fi
+        
+        if [ "$status" == "Running" ]; then color=$GREEN; else color=$RED; fi
+        
+        printf "%-12s ${color}%-10s${PLAIN} %-9s %-15s %-15s\n" "$c" "$status" "$ssh_p" "$nat_info" "$pass"
     done
-    read -p "回车返回..." d
+    read -p "按回车返回..." d
 }
 
 reconfigure_container() {
@@ -559,7 +532,7 @@ main_menu() {
     while true; do
         clear
         echo "=================================================="
-        echo -e "      ${GREEN}LXD 终极管理面板 (Smart Swap)${PLAIN}"
+        echo -e "      ${GREEN}LXD 终极管理面板 (List+ NAT)${PLAIN}"
         echo "=================================================="
         echo -e " 1. ${SKYBLUE}创建实例${PLAIN} (批量/单体)"
         echo -e " 2. ${SKYBLUE}查看列表${PLAIN}"
@@ -567,7 +540,7 @@ main_menu() {
         echo -e " 4. ${GREEN}修改配置${PLAIN} (CPU/内存/网速)"
         echo "--------------------------------------------------"
         echo -e " 5. ${YELLOW}批量开关${PLAIN} (全部启动/停止)"
-        echo -e " 6. ${YELLOW}宿主Swap${PLAIN} (智能计算)"
+        echo -e " 6. ${YELLOW}宿主Swap${PLAIN}"
         echo -e " 7. 开启 BBR 加速"
         echo "--------------------------------------------------"
         echo -e " 0. 退出"
