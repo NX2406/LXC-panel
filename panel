@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# LXD 实例管理脚本 - 全能镜像增强版 (V2025.11.13)
-# 功能：30+系统支持/精准镜像匹配/小数CPU/单机管理/修复重装Bug
+# LXD 实例管理脚本 - 自动镜像源修复版 (V2025.11.14)
+# 功能：自动挂载清华源/解决镜像下载失败/全能管理
 
 # --- 0. 启动反馈 ---
-echo "正在初始化脚本资源，请稍候..."
+echo "正在初始化脚本资源..."
 
 # --- 颜色配置 ---
 RED='\033[0;31m'
@@ -20,9 +20,8 @@ check_root() {
 }
 
 install_host_dependencies() {
-    # 静默安装常用工具
     if ! command -v jq >/dev/null 2>&1 || ! command -v bc >/dev/null 2>&1; then
-        echo -e "${SKYBLUE}安装必要依赖 (jq, bc, curl, dos2unix)...${PLAIN}"
+        echo -e "${SKYBLUE}安装依赖 (jq, bc, curl, dos2unix)...${PLAIN}"
         if command -v apt-get >/dev/null 2>&1; then
             apt-get update -y >/dev/null 2>&1 && apt-get install -y jq bc dos2unix curl >/dev/null 2>&1
         elif command -v yum >/dev/null 2>&1; then
@@ -45,6 +44,12 @@ check_lxd_env() {
         echo -e "${YELLOW}LXD 未初始化，执行自动初始化...${PLAIN}"
         lxd init --auto
     fi
+    
+    # === 新增：自动添加清华镜像源 ===
+    if ! lxc remote list | grep -q "tuna-images"; then
+        echo -e "${GREEN}正在添加清华大学镜像源 (TUNA)...${PLAIN}"
+        lxc remote add tuna-images https://mirrors.tuna.tsinghua.edu.cn/lxc-images/ --protocol=simplestreams --public --accept-certificate >/dev/null 2>&1
+    fi
 }
 
 init_env() {
@@ -62,7 +67,7 @@ detect_ip_info() {
 }
 
 check_cdn_file() {
-    echo -e "${SKYBLUE}正在优选下载线路...${PLAIN}"
+    echo -e "${SKYBLUE}优选线路检测...${PLAIN}"
     cdn_urls=("https://cdn0.spiritlhl.top/" "http://cdn1.spiritlhl.net/" "http://cdn2.spiritlhl.net/" "http://cdn3.spiritlhl.net/" "http://cdn4.spiritlhl.net/")
     local shuffled=($(shuf -e "${cdn_urls[@]}")) 
     for url in "${shuffled[@]}"; do
@@ -82,20 +87,17 @@ get_system_arch() {
     esac
 }
 
-# --- 3. 核心创建逻辑 (修复重装+精准匹配) ---
+# --- 3. 核心创建逻辑 (智能镜像源切换) ---
 
 process_image() {
     image_download_url=""; fixed_system=false; final_alias=""
     echo -e "${SKYBLUE}正在搜索镜像 [Distro: $a, Version: $b]...${PLAIN}"
     
-    # 1. 尝试自定义镜像 (优先)
+    # 1. 尝试自定义镜像 (GitHub)
     if [[ "$sys_bit" == "x86_64" || "$sys_bit" == "arm64" ]]; then
-        # 下载列表
         local list_url="${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd_images/main/${sys_bit}_all_images.txt"
-        self_fixed_images=($(curl -slk -m 6 "$list_url"))
-        
+        self_fixed_images=($(curl -slk -m 5 "$list_url"))
         for image_name in "${self_fixed_images[@]}"; do
-             # 匹配逻辑：比如 a=debian, b=12，匹配 debian_12_...
              if [[ -n "$b" ]]; then 
                 if [[ "$image_name" == "${a}_${b}"* ]]; then use_fixed_image "$image_name"; break; fi
              else 
@@ -104,35 +106,45 @@ process_image() {
         done
     fi
     
-    # 2. 尝试官方镜像 (Fallback)
-    if [ -z "$image_download_url" ]; then
+    # 2. 尝试官方镜像 (images:)
+    if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then
         local type_flag="container"; [ "$is_vm" == true ] && type_flag="virtual-machine"
+        echo -e "${YELLOW}尝试官方源 (images:)...${PLAIN}"
         
-        # 尝试标准命名 images:distro/version
-        # 比如 images:alpine/3.19
-        echo -e "${YELLOW}尝试查找官方镜像: images:${a}/${b} ...${PLAIN}"
-        
-        system=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" --arg TYPE "$type_flag" '.[] | select(.type == $TYPE and .architecture == $ARCHITECTURE) | .aliases[0].name' | head -n 1)
+        # 尝试精准匹配
+        system=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" '.[] | select(.type == $TYPE and .architecture == $ARCH) | .aliases[0].name' | head -n 1)
         
         if [ -n "$system" ]; then 
-            echo -e "${GREEN}找到官方镜像: ${system}${PLAIN}"
-            fixed_system=false
             final_alias="images:${system}"
+            echo -e "${GREEN}官方源匹配成功: ${final_alias}${PLAIN}"
+        fi
+    fi
+
+    # 3. 尝试清华源 (tuna-images:) - 终极救星
+    if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then
+        echo -e "${YELLOW}官方源连接失败或未找到，尝试切换至清华源 (TUNA)...${PLAIN}"
+        local type_flag="container"; [ "$is_vm" == true ] && type_flag="virtual-machine"
+        
+        # 清华源搜索
+        system=$(lxc image list tuna-images:${a}/${b} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" '.[] | select(.type == $TYPE and .architecture == $ARCH) | .aliases[0].name' | head -n 1)
+        
+        if [ -n "$system" ]; then
+            final_alias="tuna-images:${system}"
+            echo -e "${GREEN}清华源匹配成功: ${final_alias}${PLAIN}"
         else
-            # 再次尝试模糊搜索
-             echo -e "${YELLOW}精确匹配失败，尝试模糊搜索...${PLAIN}"
-             system=$(lxc image list images:${a} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" --arg TYPE "$type_flag" --arg VER "$b" '.[] | select(.type == $TYPE and .architecture == $ARCHITECTURE and (.aliases[0].name | contains($VER))) | .aliases[0].name' | head -n 1)
-             if [ -n "$system" ]; then
-                echo -e "${GREEN}模糊匹配成功: ${system}${PLAIN}"
-                fixed_system=false
-                final_alias="images:${system}"
-             fi
+            # 清华源模糊搜索
+            system=$(lxc image list tuna-images:${a} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" --arg VER "$b" '.[] | select(.type == $TYPE and .architecture == $ARCH and (.aliases[0].name | contains($VER))) | .aliases[0].name' | head -n 1)
+            if [ -n "$system" ]; then
+                final_alias="tuna-images:${system}"
+                echo -e "${GREEN}清华源模糊匹配成功: ${final_alias}${PLAIN}"
+            fi
         fi
     fi
     
+    # 4. 最终检查
     if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then 
-        echo -e "${RED}严重错误：未找到镜像 [${a} ${b}]${PLAIN}"
-        echo -e "请检查您的网络能否连接 images.linuxcontainers.org"
+        echo -e "${RED}严重错误：所有镜像源均未找到 [${a} ${b}]${PLAIN}"
+        echo -e "请检查您的网络连接。"
         exit 1
     fi
 }
@@ -140,27 +152,23 @@ process_image() {
 use_fixed_image() {
     local full_name=$1; fixed_system=true
     image_download_url="https://github.com/oneclickvirt/lxd_images/releases/download/${a}/${full_name}"
-    
-    # 修复：去除 .zip 后缀，避免 rebuild 报错
-    # 比如 debian_12.zip -> debian_12
     local alias_name="${full_name%.zip}"
     final_alias="$alias_name"
 
     if [[ $(lxc image alias list) != *"$alias_name"* ]]; then
-        echo -e "${SKYBLUE}正在下载自定义镜像...${PLAIN}"
+        echo -e "${SKYBLUE}下载自定义镜像...${PLAIN}"
         wget -O "lxd_image.zip" "${cdn_success_url}${image_download_url}" || { echo -e "${RED}下载失败${PLAIN}"; exit 1; }
         unzip -o "lxd_image.zip"; rm -f "lxd_image.zip"
         lxc image import lxd.tar.xz rootfs.squashfs --alias "$alias_name"
         rm -rf lxd.tar.xz rootfs.squashfs
     else
-        echo -e "${GREEN}使用本地缓存镜像: $alias_name${PLAIN}"
+        echo -e "${GREEN}使用本地缓存: $alias_name${PLAIN}"
     fi
 }
 
 create_container() {
     echo -e "${SKYBLUE}正在配置实例: $name ...${PLAIN}"
     
-    # 小数 CPU 支持
     if [[ "$cpu" == *.* ]]; then
         cpu_count=$(echo "$cpu" | awk '{print int($1+0.99)}')
         cpu_allowance=$(echo "$cpu * 100 / $cpu_count" | bc)
@@ -169,13 +177,12 @@ create_container() {
         cpu_config="-c limits.cpu=$cpu"
     fi
 
-    # 重装逻辑
     if [ "$is_rebuild" == "true" ]; then
         echo -e "${YELLOW}正在重置系统...${PLAIN}"
         lxc stop "$name" --force >/dev/null 2>&1
+        # 使用 final_alias 进行重装 (可能是 tuna-images:xxx)
         lxc rebuild "$name" "$final_alias"
     else
-        # 新建逻辑
         if lxc info "$name" >/dev/null 2>&1; then lxc delete "$name" --force; fi
         local args="$cpu_config -c limits.memory=${memory}MiB -s default"
         [ "$is_vm" == true ] && args="--vm $args"
@@ -227,7 +234,6 @@ setup_mirrors() {
 }
 
 install_packages() {
-    # 确保 dos2unix 存在
     if echo "$a" | grep -qiE "fedora|rocky|almalinux|oracle|centos"; then 
         lxc exec "$name" -- dnf install -y curl dos2unix >/dev/null 2>&1 || lxc exec "$name" -- yum install -y curl dos2unix >/dev/null 2>&1
     elif echo "$a" | grep -qiE "archlinux"; then 
@@ -291,7 +297,6 @@ configure_network_speed() {
 # --- 4. 批量执行逻辑 ---
 
 run_batch_creation() {
-    # 不再在此处解析 a/b，而是在选择菜单中直接传递
     get_system_arch; process_image
     
     for ((i=1; i<=count; i++)); do
@@ -349,7 +354,6 @@ manage_single_instance() {
                 echo -e "${RED}警告: 数据将清空，保留IP/端口。${PLAIN}"
                 read -p "确认重装? (y/n): " confirm
                 if [ "$confirm" == "y" ]; then
-                    # 简化重装菜单
                     echo -e "选择系统: [1]Debian12 [2]Ubuntu22 [3]CentOS7 [4]Alpine3.19"
                     read -p "选择: " ros; 
                     case $ros in 
@@ -360,13 +364,11 @@ manage_single_instance() {
                     esac
                     
                     name="$target_name"; is_rebuild="true"; fixed_system=false
-                    # 重新解析镜像
                     check_cdn_file; get_system_arch; process_image
                     
                     create_container # 走 rebuild
                     if [ $? -eq 0 ]; then
                         configure_resources; setup_system
-                        # 更新密码记录
                         old_desc=$(lxc config get "$name" user.description)
                         read -r -a d_arr <<< "$old_desc"
                         lxc config set "$name" user.description "${d_arr[0]} ${d_arr[1]} $passwd ${d_arr[3]} ${d_arr[4]}"
@@ -379,7 +381,7 @@ manage_single_instance() {
     done
 }
 
-# --- 6. 其他菜单 ---
+# --- 6. 辅助菜单 ---
 
 manage_all_menu() {
     clear
@@ -550,7 +552,7 @@ main_menu() {
     while true; do
         clear
         echo "=================================================="
-        echo -e "      ${GREEN}LXD 终极管理面板 (Max V2025)${PLAIN}"
+        echo -e "      ${GREEN}LXD 终极管理面板 (Auto Mirror)${PLAIN}"
         echo "=================================================="
         echo -e " 1. ${SKYBLUE}创建实例${PLAIN} (30+系统/批量)"
         echo -e " 2. ${SKYBLUE}查看列表${PLAIN}"
