@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# LXD 实例管理脚本 - 终极全能版
-# 功能：创建/查看/批量开关/BBR加速/动态改配
-# 2025.11.10 Final Updated
+# LXD 实例管理脚本 - 终极批量版
+# 功能：小数CPU支持/批量创建/端口递增/Swap管理
+# 2025.11.11 Batch & Decimal CPU Updated
 
 # --- 颜色配置 ---
 RED='\033[0;31m'
@@ -33,12 +33,13 @@ check_lxd_env() {
 
 init_env() {
     check_root
-    # 清理垃圾文件
     rm -rf lxd.tar.xz rootfs.squashfs *.zip *.zip.* ChangeMirrors.sh ssh_*.sh config.sh
-    if ! command -v jq >/dev/null 2>&1; then
-        command -v apt-get >/dev/null 2>&1 && apt-get install jq -y
-        command -v yum >/dev/null 2>&1 && yum install jq -y
-        command -v apk >/dev/null 2>&1 && apk add jq
+    # 安装必要依赖: bc 用于浮点运算
+    if ! command -v jq >/dev/null 2>&1 || ! command -v bc >/dev/null 2>&1; then
+        echo -e "${YELLOW}安装依赖 (jq, bc)...${PLAIN}"
+        command -v apt-get >/dev/null 2>&1 && apt-get install jq bc -y
+        command -v yum >/dev/null 2>&1 && yum install jq bc -y
+        command -v apk >/dev/null 2>&1 && apk add jq bc
     fi
 }
 
@@ -70,8 +71,7 @@ get_system_arch() {
     esac
 }
 
-# --- 3. 核心创建逻辑 ---
-# (为节省篇幅，保留原有的创建相关函数，逻辑未变)
+# --- 3. 核心创建逻辑 (含小数CPU算法) ---
 
 process_image() {
     image_download_url=""; fixed_system=false
@@ -104,10 +104,27 @@ use_fixed_image() {
 create_container() {
     echo -e "${SKYBLUE}创建实例: $name ...${PLAIN}"
     if lxc info "$name" >/dev/null 2>&1; then lxc delete "$name" --force; fi
-    local args="-c limits.cpu=$cpu -c limits.memory=${memory}MiB -s default"
+    
+    # --- 小数 CPU 处理核心算法 ---
+    # 如果 cpu 包含小数点
+    if [[ "$cpu" == *.* ]]; then
+        # 向上取整获取核心数 (例如 0.5 -> 1, 1.5 -> 2)
+        cpu_count=$(echo "$cpu" | awk '{print int($1+0.99)}')
+        # 计算百分比 allowance (例如 0.5/1=50%, 1.5/2=75%)
+        cpu_allowance=$(echo "$cpu * 100 / $cpu_count" | bc)
+        cpu_config="-c limits.cpu=$cpu_count -c limits.cpu.allowance=${cpu_allowance}%"
+    else
+        # 整数直接使用
+        cpu_config="-c limits.cpu=$cpu"
+    fi
+    # ---------------------------
+
+    local args="$cpu_config -c limits.memory=${memory}MiB -s default"
     [ "$is_vm" == true ] && args="--vm $args"
+    
     if [ -n "$image_download_url" ]; then lxc init "$image_name" "$name" $args; else lxc init images:${system} "$name" $args; fi
-    if [ $? -ne 0 ]; then echo -e "${RED}创建失败!${PLAIN}"; exit 1; fi
+    if [ $? -ne 0 ]; then echo -e "${RED}创建失败!${PLAIN}"; return 1; fi
+    return 0
 }
 
 configure_storage() {
@@ -124,7 +141,7 @@ configure_resources() {
     lxc config device set "$name" root limits.read 5000iops
     lxc config device set "$name" root limits.write 5000iops
     lxc config set "$name" limits.cpu.priority 0
-    lxc config set "$name" limits.cpu.allowance 50%
+    # 注意：这里不再覆盖 allowance，因为 create_container 里已经算好了
     lxc config set "$name" security.nesting true
     if [ "$is_vm" == true ]; then lxc config set "$name" security.secureboot=false; else lxc config set "$name" limits.memory.swap true; fi
 }
@@ -166,13 +183,14 @@ setup_ssh() {
 }
 
 configure_port() {
+    # 这里的 sshn, nat1, nat2 是当前循环的变量
     echo -e "${SKYBLUE}网络配置...${PLAIN}"; [ "$is_vm" == true ] && mr=20 || mr=5
-    for ((i=1; i<=mr; i++)); do sleep 5; container_ip=$(lxc list "$name" --format json | jq -r '.[0].state.network.eth0.addresses[]? | select(.family=="inet") | .address'); [ -n "$container_ip" ] && break; done
+    for ((j=1; j<=mr; j++)); do sleep 5; container_ip=$(lxc list "$name" --format json | jq -r '.[0].state.network.eth0.addresses[]? | select(.family=="inet") | .address'); [ -n "$container_ip" ] && break; done
     if [ -z "$container_ip" ]; then echo -e "${RED}获取IP失败${PLAIN}"; return; fi
     ipv4_address=$(ip addr show | awk '/inet .*global/ && !/inet6/ {print $2}' | sed -n '1p' | cut -d/ -f1)
     lxc config device override "$name" eth0 ipv4.address="$container_ip" 2>/dev/null || lxc config device set "$name" eth0 ipv4.address "$container_ip" 2>/dev/null
-    lxc config device add "$name" ssh-port proxy listen=tcp:$ipv4_address:$sshn connect=tcp:$container_ip:22 nat=true
-    if [ "$nat1" != "0" ] && [ "$nat2" != "0" ]; then lxc config device add "$name" nattcp-ports proxy listen=tcp:$ipv4_address:$nat1-$nat2 connect=tcp:0.0.0.0:$nat1-$nat2 nat=true; lxc config device add "$name" natudp-ports proxy listen=udp:$ipv4_address:$nat1-$nat2 connect=udp:0.0.0.0:$nat1-$nat2 nat=true; fi
+    lxc config device add "$name" ssh-port proxy listen=tcp:$ipv4_address:$curr_sshn connect=tcp:$container_ip:22 nat=true
+    if [ "$curr_nat1" != "0" ] && [ "$curr_nat2" != "0" ]; then lxc config device add "$name" nattcp-ports proxy listen=tcp:$ipv4_address:$curr_nat1-$curr_nat2 connect=tcp:0.0.0.0:$curr_nat1-$curr_nat2 nat=true; lxc config device add "$name" natudp-ports proxy listen=udp:$ipv4_address:$curr_nat1-$curr_nat2 connect=udp:0.0.0.0:$curr_nat1-$curr_nat2 nat=true; fi
 }
 
 configure_ipv6() {
@@ -186,184 +204,157 @@ configure_network_speed() {
     lxc start "$name"
 }
 
-cleanup_and_output() {
-    rm -f lxd_image.zip lxd.tar.xz rootfs.squashfs
-    clear
-    echo "=================================================="
-    echo -e "      ${GREEN}创建成功 (Success)${PLAIN}"
-    echo "=================================================="
-    echo -e " 名称: ${SKYBLUE}$name${PLAIN} | 系统: ${SKYBLUE}$system${PLAIN}"
-    echo -e " SSH端口: ${GREEN}$sshn${PLAIN}"
-    [ "$is_vm" == false ] && echo -e " 密码: ${GREEN}$passwd${PLAIN}" || echo -e " 密码: ${YELLOW}请VNC设置${PLAIN}"
-    [ "$nat1" != "0" ] && echo -e " NAT: ${SKYBLUE}$nat1 - $nat2${PLAIN}"
-    lxc config set "$name" user.description "$name $sshn $passwd $nat1 $nat2"
-    echo "$name $sshn $passwd $nat1 $nat2" >>"$name"
-    echo -e "${YELLOW}>>> 防火墙放行命令(宿主机执行):${PLAIN}"
-    if command -v ufw >/dev/null 2>&1; then echo -e "ufw allow $sshn/tcp"; [ "$nat1" != "0" ] && echo -e "ufw allow $nat1:$nat2/tcp && ufw allow $nat1:$nat2/udp"; else echo -e "iptables -I INPUT -p tcp --dport $sshn -j ACCEPT"; [ "$nat1" != "0" ] && echo -e "iptables -I INPUT -p tcp --dport $nat1:$nat2 -j ACCEPT"; fi
-}
+# --- 4. 批量执行逻辑 ---
 
-# --- 4. 新增功能模块 ---
-
-# 一键开启/关闭
-manage_all_containers() {
-    local action=$1
-    local names=$(lxc list --format csv -c n)
-    if [ -z "$names" ]; then echo -e "${YELLOW}当前无实例。${PLAIN}"; return; fi
+run_batch_creation() {
+    # 准备基础环境
+    a="${system%%[0-9]*}"; b="${system##*[!0-9.]}"
+    if [[ "$system" == "rockylinux9" ]]; then a="rockylinux"; b="9"; 
+    elif [[ "$system" == "almalinux9" ]]; then a="almalinux"; b="9";
+    fi
+    get_system_arch
     
-    echo -e "${SKYBLUE}正在$([ "$action" == "start" ] && echo "启动" || echo "停止")所有容器...${PLAIN}"
-    for container in $names; do
-        if [ "$action" == "start" ]; then
-            lxc start "$container" >/dev/null 2>&1
-            echo -e "启动 ${GREEN}$container${PLAIN} ... 完成"
+    # 下载镜像一次
+    process_image
+    
+    # 批量循环
+    for ((i=1; i<=count; i++)); do
+        # 计算当前实例名
+        if [ "$count" -eq 1 ]; then
+            name="$basename"
         else
-            lxc stop "$container" --timeout=10 >/dev/null 2>&1
-            echo -e "停止 ${YELLOW}$container${PLAIN} ... 完成"
+            name="${basename}${i}"
+        fi
+        
+        # 计算当前端口
+        curr_sshn=$((sshn_start + i - 1))
+        
+        if [ "$nat_start" != "0" ]; then
+            # 每个实例分配 (nat_end - nat_start + 1) 个端口
+            # 假设默认偏移量 25 (20002-20025 是 24个，这里简单按25步长计算)
+            port_range=$((nat_end - nat_start))
+            curr_nat1=$((nat_start + (i-1) * (port_range + 1)))
+            curr_nat2=$((curr_nat1 + port_range))
+        else
+            curr_nat1=0
+            curr_nat2=0
+        fi
+
+        echo -e "${DIVIDER}"
+        echo -e "正在创建第 $i / $count 个实例: ${GREEN}$name${PLAIN}"
+        echo -e "SSH端口: $curr_sshn | NAT: $curr_nat1 - $curr_nat2"
+        echo -e "${DIVIDER}"
+
+        create_container
+        if [ $? -eq 0 ]; then
+            configure_storage
+            configure_resources
+            setup_system
+            configure_port
+            configure_network_speed
+            
+            # 保存记录
+            lxc config set "$name" user.description "$name $curr_sshn $passwd $curr_nat1 $curr_nat2"
+            echo "$name $curr_sshn $passwd $curr_nat1 $curr_nat2" >> "batch_created.log"
+            echo -e "${GREEN}$name 创建成功!${PLAIN}"
         fi
     done
-    read -p "操作完成，按回车返回..." d
-}
-
-# 开启 BBR
-enable_bbr() {
-    clear
-    echo -e "${SKYBLUE}正在开启 BBR 加速 (宿主机)...${PLAIN}"
-    if grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo -e "${YELLOW}配置已存在，跳过添加。${PLAIN}"
-    else
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        echo -e "${GREEN}配置已添加。${PLAIN}"
-    fi
-    sysctl -p >/dev/null 2>&1
-    echo -e "${GREEN}BBR 开启成功！${PLAIN}"
-    echo -e "当前状态: $(sysctl net.ipv4.tcp_congestion_control)"
+    
+    rm -f lxd_image.zip lxd.tar.xz rootfs.squashfs
+    echo -e "${GREEN}批量创建完成！${PLAIN}"
+    echo -e "防火墙放行请参考: ufw allow $sshn_start:$((sshn_start + count - 1))/tcp"
     read -p "按回车返回..." d
 }
 
-# 动态改配 (核心新功能)
+# --- 5. Swap 管理 ---
+
+add_host_swap() {
+    clear
+    echo -e "${GREEN}=== 宿主机 Swap 管理 ===${PLAIN}"
+    current_swap=$(free -m | awk '/Swap/ {print $2}')
+    echo -e "当前 Swap 大小: ${SKYBLUE}${current_swap} MB${PLAIN}"
+    
+    read -p "请输入要增加的 Swap 大小 (MB) [默认 1024]: " swap_size
+    swap_size=${swap_size:-1024}
+    
+    echo -e "${YELLOW}正在创建 Swap 文件，请稍候...${PLAIN}"
+    dd if=/dev/zero of=/swapfile bs=1M count=$swap_size
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    
+    # 写入 fstab
+    if ! grep -q "/swapfile" /etc/fstab; then
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+    
+    echo -e "${GREEN}Swap 创建成功!${PLAIN}"
+    free -m
+    read -p "按回车返回..." d
+}
+
+# --- 6. 其他功能 (改配/BBR等) ---
+
 reconfigure_container() {
     while true; do
         clear
-        echo -e "${GREEN}=== 容器配置修改 (Reconfigure) ===${PLAIN}"
-        
-        # 1. 获取并列表
+        echo -e "${GREEN}=== 容器配置修改 (支持小数CPU) ===${PLAIN}"
         local names=($(lxc list --format csv -c n))
         if [ ${#names[@]} -eq 0 ]; then echo -e "${YELLOW}无实例。${PLAIN}"; read -p "回车返回..." d; return; fi
-        
-        echo "请选择要修改的容器:"
-        for i in "${!names[@]}"; do
-            printf "%2d) %s\n" $((i+1)) "${names[$i]}"
-        done
-        echo " 0) 返回主菜单"
-        
-        read -p "输入编号: " idx
-        if [ "$idx" == "0" ]; then return; fi
+        for i in "${!names[@]}"; do printf "%2d) %s\n" $((i+1)) "${names[$i]}"; done
+        echo " 0) 返回上级"
+        read -p "输入编号: " idx; [ "$idx" == "0" ] && return
         target_name="${names[$((idx-1))]}"
-        if [ -z "$target_name" ]; then echo -e "${RED}无效编号${PLAIN}"; sleep 1; continue; fi
         
-        # 2. 读取当前配置
         cur_cpu=$(lxc config get "$target_name" limits.cpu 2>/dev/null)
-        cur_mem=$(lxc config get "$target_name" limits.memory 2>/dev/null)
-        cur_disk=$(lxc config device get "$target_name" root size 2>/dev/null)
-        cur_net=$(lxc config device get "$target_name" eth0 limits.max 2>/dev/null)
         [ -z "$cur_cpu" ] && cur_cpu="默认"
-        [ -z "$cur_mem" ] && cur_mem="默认"
-        [ -z "$cur_disk" ] && cur_disk="默认"
-        [ -z "$cur_net" ] && cur_net="无限制"
-
-        clear
-        echo -e "当前容器: ${SKYBLUE}$target_name${PLAIN}"
-        echo "--------------------------------"
-        echo -e "1. 修改 CPU 核数 (当前: ${GREEN}$cur_cpu${PLAIN})"
-        echo -e "2. 修改 内存 大小 (当前: ${GREEN}$cur_mem${PLAIN})"
-        echo -e "3. 修改 硬盘 大小 (当前: ${GREEN}$cur_disk${PLAIN})"
-        echo -e "4. 修改 网速 限制 (当前: ${GREEN}$cur_net${PLAIN})"
-        echo "0. 返回上级"
-        echo "--------------------------------"
-        read -p "请选择修改项 [0-4]: " opt
         
+        clear; echo "目标: $target_name"
+        echo "1. 修改 CPU (当前: $cur_cpu)"
+        echo "2. 修改 内存"
+        echo "3. 修改 硬盘"
+        echo "4. 修改 网速"
+        read -p "选择: " opt
         case $opt in
-            1)
-                read -p "请输入新 CPU 核数 (如 2): " new_val
-                lxc config set "$target_name" limits.cpu "$new_val"
-                echo -e "${GREEN}CPU 修改成功!${PLAIN}"
+            1) 
+                read -p "输入新CPU (支持小数如 0.5): " new_cpu
+                if [[ "$new_cpu" == *.* ]]; then
+                    cpu_c=$(echo "$new_cpu" | awk '{print int($1+0.99)}')
+                    cpu_a=$(echo "$new_cpu * 100 / $cpu_c" | bc)
+                    lxc config set "$target_name" limits.cpu "$cpu_c"
+                    lxc config set "$target_name" limits.cpu.allowance "${cpu_a}%"
+                    echo -e "${GREEN}CPU已设为: ${cpu_c}核 (${cpu_a}%)${PLAIN}"
+                else
+                    lxc config set "$target_name" limits.cpu "$new_cpu"
+                    lxc config set "$target_name" limits.cpu.allowance "100%" # 恢复满血
+                    echo -e "${GREEN}CPU已设为: ${new_cpu}核${PLAIN}"
+                fi
                 ;;
-            2)
-                read -p "请输入新 内存 大小 (如 512MiB): " new_val
-                # 自动补全单位
-                [[ "$new_val" != *MiB && "$new_val" != *GB ]] && new_val="${new_val}MiB"
-                lxc config set "$target_name" limits.memory "$new_val"
-                echo -e "${GREEN}内存 修改成功!${PLAIN}"
-                ;;
-            3)
-                read -p "请输入新 硬盘 大小 (如 5GB): " new_val
-                [[ "$new_val" != *MB && "$new_val" != *GB ]] && new_val="${new_val}GB"
-                # 硬盘修改需要 override root 设备
-                lxc config device override "$target_name" root size="$new_val" >/dev/null 2>&1 || \
-                lxc config device set "$target_name" root size="$new_val"
-                echo -e "${GREEN}硬盘 修改成功! (注意: 仅支持扩容，缩容可能失败)${PLAIN}"
-                ;;
-            4)
-                read -p "请输入新 网速 (如 100Mbit): " new_val
-                [[ "$new_val" != *Mbit ]] && new_val="${new_val}Mbit"
-                lxc config device set "$target_name" eth0 limits.max "$new_val"
-                lxc config device set "$target_name" eth0 limits.ingress "$new_val"
-                lxc config device set "$target_name" eth0 limits.egress "$new_val"
-                echo -e "${GREEN}网速 修改成功!${PLAIN}"
-                ;;
-            0) continue ;;
-            *) echo "无效选项";;
+            2) read -p "输入内存 (如 512MiB): " v; lxc config set "$target_name" limits.memory "$v";;
+            3) read -p "输入硬盘 (如 5GB): " v; lxc config device override "$target_name" root size="$v" 2>/dev/null || lxc config device set "$target_name" root size="$v";;
+            4) read -p "输入网速 (如 50Mbit): " v; lxc config device set "$target_name" eth0 limits.max "$v";;
         esac
-        read -p "按回车继续..." d
+        read -p "回车继续..." d
     done
 }
 
-# --- 5. 菜单逻辑 ---
+manage_all_containers() {
+    local action=$1
+    local names=$(lxc list --format csv -c n)
+    for c in $names; do 
+        [ "$action" == "start" ] && lxc start "$c" || lxc stop "$c"
+    done
+    echo "操作完成"
+    read -p "回车返回..." d
+}
 
-start_creation_wizard() {
-    clear
-    echo -e "${GREEN}创建向导${PLAIN}"
-    read -p "1. 名称 [默认:test]: " name; name=${name:-test}
-    read -p "2. CPU [默认:1]: " cpu; cpu=${cpu:-1}
-    read -p "3. 内存MB [默认:256]: " memory; memory=${memory:-256}
-    read -p "4. 硬盘GB [默认:2]: " disk; disk=${disk:-2}
-
-    echo -e "\n5. 系统选择:"
-    printf " %-27s %s\n" "1) Debian 12"  "11) CentOS 7"
-    printf " %-27s %s\n" "2) Debian 11"  "12) Rocky 9"
-    printf " %-27s %s\n" "3) Ubuntu 22.04" "13) AlmaLinux 9"
-    printf " %-27s %s\n" "4) Ubuntu 20.04" "21) Windows 11 (VM)"
-    printf " %-27s %s\n" "6) Alpine 3.19" "22) Windows 10 (VM)"
-    read -p "选择 [1-22]: " os_c
-    is_vm=false
-    case $os_c in
-        1) system="debian12" ;; 2) system="debian11" ;; 3) system="ubuntu22.04" ;; 4) system="ubuntu20.04" ;;
-        6) system="alpine3.19" ;; 11) system="centos7" ;; 12) system="rockylinux9" ;; 13) system="almalinux9" ;;
-        21) system="win11"; is_vm=true ;; 22) system="win10"; is_vm=true ;;
-        *) system="debian12" ;;
-    esac
-
-    mirror_choice="auto"
-    if [ "$is_vm" == false ]; then
-        echo -e "\n6. 镜像源: [1]自动 [2]国内 [3]国外"
-        read -p "选择 [1]: " m; [[ "$m" == "2" ]] && mirror_choice="cn"; [[ "$m" == "3" ]] && mirror_choice="global"
+enable_bbr() {
+    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p
     fi
-
-    echo -e "\n7. 端口 (SSH默认:20001)"
-    read -p "SSH端口: " sshn; sshn=${sshn:-20001}
-    read -p "NAT起始(0禁用): " nat1; nat1=${nat1:-20002}
-    [[ "$nat1" != "0" ]] && { read -p "NAT结束[20025]: " nat2; nat2=${nat2:-20025}; } || nat2=0
-
-    read -p "8. 限速Mbit [10240]: " in; in=${in:-10240}; out=$in
-    if [ "$is_vm" == false ]; then read -p "IPv6? (y/n): " enable_ipv6; fi
-    
-    check_cdn_file
-    if [[ "$system" == "rockylinux9" ]]; then a="rockylinux"; b="9"; 
-    elif [[ "$system" == "almalinux9" ]]; then a="almalinux"; b="9";
-    else a="${system%%[0-9]*}"; b="${system##*[!0-9.]}"; fi
-    
-    get_system_arch; process_image; create_container; configure_storage; configure_resources
-    setup_system; configure_port; configure_network_speed; cleanup_and_output
+    echo -e "${GREEN}BBR 已开启${PLAIN}"
     read -p "回车返回..." d
 }
 
@@ -371,46 +362,81 @@ view_instances() {
     clear
     local names=$(lxc list --format csv -c n)
     if [ -z "$names" ]; then echo "无实例"; read -p "回车返回..." d; return; fi
-    printf "%-15s %-12s %-10s %-15s\n" "名称" "状态" "SSH端口" "Root密码"
+    printf "%-15s %-10s %-10s %-15s\n" "名称" "状态" "SSH端口" "Root密码"
     echo -e "${DIVIDER}"
     for c in $names; do
         info=$(lxc list "$c" --format json)
         status=$(echo "$info" | jq -r '.[0].status')
         desc=$(lxc config get "$c" user.description 2>/dev/null)
         read -r -a d_arr <<< "$desc"
-        ssh_p="${d_arr[1]}"; pass="${d_arr[2]}"
-        [ -z "$ssh_p" ] && ssh_p="-"
-        [ -z "$pass" ] && pass="-"
-        if [ "$status" == "Running" ]; then color=$GREEN; else color=$RED; fi
-        printf "%-15s ${color}%-12s${PLAIN} %-10s %-15s\n" "$c" "$status" "$ssh_p" "$pass"
+        ssh_p="${d_arr[1]}"; pass="${d_arr[2]}"; [ -z "$ssh_p" ] && ssh_p="-"; [ -z "$pass" ] && pass="-"
+        [ "$status" == "Running" ] && color=$GREEN || color=$RED
+        printf "%-15s ${color}%-10s${PLAIN} %-10s %-15s\n" "$c" "$status" "$ssh_p" "$pass"
     done
-    read -p "按回车返回..." d
+    read -p "回车返回..." d
+}
+
+# --- 7. 主菜单 ---
+
+start_wizard() {
+    clear
+    echo -e "${GREEN}批量创建向导${PLAIN}"
+    read -p "1. 基础名称 (如 test): " basename; basename=${basename:-test}
+    read -p "2. 创建数量 (如 1): " count; count=${count:-1}
+    read -p "3. CPU核数 (支持小数,如 0.5): " cpu; cpu=${cpu:-1}
+    read -p "4. 内存MB [256]: " memory; memory=${memory:-256}
+    read -p "5. 硬盘GB [2]: " disk; disk=${disk:-2}
+
+    echo -e "\n系统: [1]Debian12 [2]Debian11 [3]Ubuntu22 [4]CentOS7 [5]Alpine"
+    read -p "选择 [1]: " os_c
+    case $os_c in
+        2) system="debian11" ;; 3) system="ubuntu22.04" ;; 4) system="centos7" ;; 5) system="alpine3.19" ;;
+        *) system="debian12" ;;
+    esac
+    is_vm=false
+    mirror_choice="auto"
+    
+    echo -e "\n端口设置 (自动递增):"
+    read -p "起始 SSH 端口 [20001]: " sshn_start; sshn_start=${sshn_start:-20001}
+    read -p "起始 NAT 端口 [30000] (0禁用): " nat_start; nat_start=${nat_start:-30000}
+    if [ "$nat_start" != "0" ]; then
+        read -p "每个实例 NAT 结束端口 [30025]: " nat_end; nat_end=${nat_end:-30025}
+    else
+        nat_end=0
+    fi
+    
+    read -p "限速Mbit [10240]: " in; in=${in:-10240}; out=$in
+    check_cdn_file
+    run_batch_creation
 }
 
 main_menu() {
     while true; do
         clear
         echo "=================================================="
-        echo -e "      ${GREEN}LXD 终极管理面板 (Ultimate)${PLAIN}"
+        echo -e "      ${GREEN}LXD 终极管理面板 (Batch & Decimal)${PLAIN}"
         echo "=================================================="
-        echo -e " 1. ${SKYBLUE}创建新实例${PLAIN} (Create)"
-        echo -e " 2. ${SKYBLUE}查看实例表${PLAIN} (List)"
-        echo -e " 3. ${GREEN}修改容器配置${PLAIN} (Reconfigure) [HOT]"
+        echo -e " 1. ${SKYBLUE}创建实例${PLAIN} (批量/单体)"
+        echo -e " 2. ${SKYBLUE}查看列表${PLAIN}"
+        echo -e " 3. ${GREEN}修改配置${PLAIN} (支持小数CPU)"
         echo "--------------------------------------------------"
-        echo -e " 4. ${GREEN}开启所有容器${PLAIN} (Start All)"
-        echo -e " 5. ${YELLOW}关闭所有容器${PLAIN} (Stop All)"
-        echo -e " 6. ${GREEN}开启 BBR 加速${PLAIN} (Enable BBR)"
+        echo -e " 4. ${YELLOW}开启宿主机 Swap${PLAIN} (防OOM)"
+        echo -e " 5. 开启 BBR 加速"
+        echo -e " 6. 开启/关闭 所有容器"
         echo "--------------------------------------------------"
-        echo -e " 0. 退出 (Exit)"
+        echo -e " 0. 退出"
         echo "=================================================="
         read -p "请选择: " choice
         case $choice in
-            1) start_creation_wizard ;;
+            1) start_wizard ;;
             2) view_instances ;;
             3) reconfigure_container ;;
-            4) manage_all_containers "start" ;;
-            5) manage_all_containers "stop" ;;
-            6) enable_bbr ;;
+            4) add_host_swap ;;
+            5) enable_bbr ;;
+            6) 
+                read -p "start or stop? " act
+                manage_all_containers "$act" 
+                ;;
             0) exit 0 ;;
             *) ;;
         esac
