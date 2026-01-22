@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# LXD 实例管理脚本 - 自动镜像源修复版 (V2025.11.14)
-# 功能：自动挂载清华源/解决镜像下载失败/全能管理
+# LXD 实例管理脚本 - 稳定版 (移除Alpine)
+# 2025.11.15 Stable
 
 # --- 0. 启动反馈 ---
 echo "正在初始化脚本资源..."
@@ -44,10 +44,8 @@ check_lxd_env() {
         echo -e "${YELLOW}LXD 未初始化，执行自动初始化...${PLAIN}"
         lxd init --auto
     fi
-    
-    # === 新增：自动添加清华镜像源 ===
+    # 自动添加清华源 (加速 Debian/Ubuntu)
     if ! lxc remote list | grep -q "tuna-images"; then
-        echo -e "${GREEN}正在添加清华大学镜像源 (TUNA)...${PLAIN}"
         lxc remote add tuna-images https://mirrors.tuna.tsinghua.edu.cn/lxc-images/ --protocol=simplestreams --public --accept-certificate >/dev/null 2>&1
     fi
 }
@@ -87,13 +85,13 @@ get_system_arch() {
     esac
 }
 
-# --- 3. 核心创建逻辑 (智能镜像源切换) ---
+# --- 3. 核心逻辑 ---
 
 process_image() {
     image_download_url=""; fixed_system=false; final_alias=""
     echo -e "${SKYBLUE}正在搜索镜像 [Distro: $a, Version: $b]...${PLAIN}"
     
-    # 1. 尝试自定义镜像 (GitHub)
+    # 1. 自定义
     if [[ "$sys_bit" == "x86_64" || "$sys_bit" == "arm64" ]]; then
         local list_url="${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd_images/main/${sys_bit}_all_images.txt"
         self_fixed_images=($(curl -slk -m 5 "$list_url"))
@@ -106,33 +104,26 @@ process_image() {
         done
     fi
     
-    # 2. 尝试官方镜像 (images:)
+    # 2. 官方源
     if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then
         local type_flag="container"; [ "$is_vm" == true ] && type_flag="virtual-machine"
-        echo -e "${YELLOW}尝试官方源 (images:)...${PLAIN}"
-        
-        # 尝试精准匹配
         system=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" '.[] | select(.type == $TYPE and .architecture == $ARCH) | .aliases[0].name' | head -n 1)
-        
         if [ -n "$system" ]; then 
             final_alias="images:${system}"
             echo -e "${GREEN}官方源匹配成功: ${final_alias}${PLAIN}"
         fi
     fi
 
-    # 3. 尝试清华源 (tuna-images:) - 终极救星
+    # 3. 清华源
     if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then
-        echo -e "${YELLOW}官方源连接失败或未找到，尝试切换至清华源 (TUNA)...${PLAIN}"
+        echo -e "${YELLOW}切换至清华源 (TUNA)...${PLAIN}"
         local type_flag="container"; [ "$is_vm" == true ] && type_flag="virtual-machine"
-        
-        # 清华源搜索
         system=$(lxc image list tuna-images:${a}/${b} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" '.[] | select(.type == $TYPE and .architecture == $ARCH) | .aliases[0].name' | head -n 1)
-        
         if [ -n "$system" ]; then
             final_alias="tuna-images:${system}"
             echo -e "${GREEN}清华源匹配成功: ${final_alias}${PLAIN}"
         else
-            # 清华源模糊搜索
+            # 模糊搜索
             system=$(lxc image list tuna-images:${a} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" --arg VER "$b" '.[] | select(.type == $TYPE and .architecture == $ARCH and (.aliases[0].name | contains($VER))) | .aliases[0].name' | head -n 1)
             if [ -n "$system" ]; then
                 final_alias="tuna-images:${system}"
@@ -141,10 +132,8 @@ process_image() {
         fi
     fi
     
-    # 4. 最终检查
     if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then 
-        echo -e "${RED}严重错误：所有镜像源均未找到 [${a} ${b}]${PLAIN}"
-        echo -e "请检查您的网络连接。"
+        echo -e "${RED}错误：未找到镜像 [${a} ${b}]${PLAIN}"
         exit 1
     fi
 }
@@ -154,21 +143,17 @@ use_fixed_image() {
     image_download_url="https://github.com/oneclickvirt/lxd_images/releases/download/${a}/${full_name}"
     local alias_name="${full_name%.zip}"
     final_alias="$alias_name"
-
     if [[ $(lxc image alias list) != *"$alias_name"* ]]; then
         echo -e "${SKYBLUE}下载自定义镜像...${PLAIN}"
         wget -O "lxd_image.zip" "${cdn_success_url}${image_download_url}" || { echo -e "${RED}下载失败${PLAIN}"; exit 1; }
         unzip -o "lxd_image.zip"; rm -f "lxd_image.zip"
         lxc image import lxd.tar.xz rootfs.squashfs --alias "$alias_name"
         rm -rf lxd.tar.xz rootfs.squashfs
-    else
-        echo -e "${GREEN}使用本地缓存: $alias_name${PLAIN}"
     fi
 }
 
 create_container() {
     echo -e "${SKYBLUE}正在配置实例: $name ...${PLAIN}"
-    
     if [[ "$cpu" == *.* ]]; then
         cpu_count=$(echo "$cpu" | awk '{print int($1+0.99)}')
         cpu_allowance=$(echo "$cpu * 100 / $cpu_count" | bc)
@@ -180,7 +165,6 @@ create_container() {
     if [ "$is_rebuild" == "true" ]; then
         echo -e "${YELLOW}正在重置系统...${PLAIN}"
         lxc stop "$name" --force >/dev/null 2>&1
-        # 使用 final_alias 进行重装 (可能是 tuna-images:xxx)
         lxc rebuild "$name" "$final_alias"
     else
         if lxc info "$name" >/dev/null 2>&1; then lxc delete "$name" --force; fi
@@ -188,7 +172,6 @@ create_container() {
         [ "$is_vm" == true ] && args="--vm $args"
         lxc init "$final_alias" "$name" $args
     fi
-    
     if [ $? -ne 0 ]; then echo -e "${RED}操作失败!${PLAIN}"; return 1; fi
     return 0
 }
@@ -238,8 +221,6 @@ install_packages() {
         lxc exec "$name" -- dnf install -y curl dos2unix >/dev/null 2>&1 || lxc exec "$name" -- yum install -y curl dos2unix >/dev/null 2>&1
     elif echo "$a" | grep -qiE "archlinux"; then 
         lxc exec "$name" -- pacman -Sy --noconfirm curl dos2unix >/dev/null 2>&1
-    elif echo "$a" | grep -qiE "alpine"; then 
-        lxc exec "$name" -- apk add --no-cache curl >/dev/null 2>&1
     else 
         lxc exec "$name" -- apt-get update -y >/dev/null 2>&1
         lxc exec "$name" -- apt-get install curl dos2unix -y >/dev/null 2>&1
@@ -247,19 +228,16 @@ install_packages() {
 }
 
 setup_ssh() {
-    local st="bash"; echo "$a" | grep -qiE "alpine|openwrt" && st="sh"
+    local st="bash"; 
     local sn="ssh_${st}.sh"
     [ ! -f "/usr/local/bin/$sn" ] && curl -L "${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/$sn" -o "/usr/local/bin/$sn" && chmod 777 "/usr/local/bin/$sn" && dos2unix "/usr/local/bin/$sn"
     lxc file push "/usr/local/bin/$sn" "$name"/root/
     lxc exec "$name" -- chmod 777 "$sn"
-    if [ "$st" == "sh" ]; then lxc exec "$name" -- ./"$sn" ${passwd}
-    else 
-        lxc exec "$name" -- dos2unix "$sn"
-        lxc exec "$name" -- sudo ./"$sn" $passwd
-        [ ! -f /usr/local/bin/config.sh ] && curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh -o /usr/local/bin/config.sh && chmod +x /usr/local/bin/config.sh && dos2unix /usr/local/bin/config.sh
-        lxc file push /usr/local/bin/config.sh "$name"/root/
-        lxc exec "$name" -- bash config.sh
-    fi
+    lxc exec "$name" -- dos2unix "$sn"
+    lxc exec "$name" -- sudo ./"$sn" $passwd
+    [ ! -f /usr/local/bin/config.sh ] && curl -L ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd/main/scripts/config.sh -o /usr/local/bin/config.sh && chmod +x /usr/local/bin/config.sh && dos2unix /usr/local/bin/config.sh
+    lxc file push /usr/local/bin/config.sh "$name"/root/
+    lxc exec "$name" -- bash config.sh
 }
 
 configure_port() {
@@ -294,11 +272,8 @@ configure_network_speed() {
     lxc config device set "$name" eth0 limits.max "${limit_mbit}Mbit"
 }
 
-# --- 4. 批量执行逻辑 ---
-
 run_batch_creation() {
     get_system_arch; process_image
-    
     for ((i=1; i<=count; i++)); do
         if [ "$count" -eq 1 ]; then name="$basename"; else name="${basename}${i}"; fi
         curr_sshn=$((sshn_start + i - 1))
@@ -323,8 +298,6 @@ run_batch_creation() {
     echo -e "${GREEN}批量任务完成！${PLAIN}"
     read -p "按回车返回..." d
 }
-
-# --- 5. 单实例管理 ---
 
 manage_single_instance() {
     while true; do
@@ -354,19 +327,18 @@ manage_single_instance() {
                 echo -e "${RED}警告: 数据将清空，保留IP/端口。${PLAIN}"
                 read -p "确认重装? (y/n): " confirm
                 if [ "$confirm" == "y" ]; then
-                    echo -e "选择系统: [1]Debian12 [2]Ubuntu22 [3]CentOS7 [4]Alpine3.19"
+                    echo -e "选择系统: [1]Debian12 [2]Ubuntu22 [3]CentOS7"
                     read -p "选择: " ros; 
                     case $ros in 
                         2) a="ubuntu"; b="22.04" ;; 
                         3) a="centos"; b="7" ;; 
-                        4) a="alpine"; b="3.19" ;;
                         *) a="debian"; b="12" ;; 
                     esac
                     
                     name="$target_name"; is_rebuild="true"; fixed_system=false
                     check_cdn_file; get_system_arch; process_image
                     
-                    create_container # 走 rebuild
+                    create_container 
                     if [ $? -eq 0 ]; then
                         configure_resources; setup_system
                         old_desc=$(lxc config get "$name" user.description)
@@ -380,8 +352,6 @@ manage_single_instance() {
         read -p "按回车继续..." d
     done
 }
-
-# --- 6. 辅助菜单 ---
 
 manage_all_menu() {
     clear
@@ -474,7 +444,7 @@ reconfigure_container() {
 
 start_wizard() {
     clear
-    echo -e "${GREEN}创建向导${PLAIN}"
+    echo -e "${GREEN}创建向导 (Alpine 已移除)${PLAIN}"
     read -p "1. 基础名称 (如 test): " basename; basename=${basename:-test}
     read -p "2. 创建数量 (如 1): " count; count=${count:-1}
     read -p "3. CPU核数 (支持小数,如 0.5): " cpu; cpu=${cpu:-1}
@@ -488,18 +458,15 @@ start_wizard() {
     echo " 4) Ubuntu 24.04 LTS        5) Ubuntu 22.04 LTS        6) Ubuntu 20.04 LTS"
     echo -e "${SKYBLUE}[RHEL/CentOS]${PLAIN}"
     echo " 7) CentOS 7                8) CentOS 9 Stream         9) Rocky Linux 9"
-    echo -e "${SKYBLUE}[Lightweight]${PLAIN}"
-    echo "10) Alpine 3.19            11) Alpine 3.18            12) Arch Linux"
     echo -e "${SKYBLUE}[Other]${PLAIN}"
-    echo "13) Kali Linux             14) Fedora 39              15) Oracle Linux 9"
+    echo "10) Arch Linux             11) Kali Linux             12) Fedora 39"
     echo -e "${SKYBLUE}[Windows/VM]${PLAIN}"
-    echo "16) Windows 11             17) Windows 10             18) Windows Server 2022"
-    echo "19) 自定义 (Custom)"
+    echo "13) Windows 11             14) Windows 10             15) Windows Server 2022"
+    echo "16) 自定义 (Custom)"
 
-    read -p "请选择系统 [1-19]: " os_c
+    read -p "请选择系统 [1-16]: " os_c
     is_vm=false
     
-    # 强制设置 a 和 b，避免正则解析错误
     case $os_c in
         1) a="debian"; b="12" ;;
         2) a="debian"; b="11" ;;
@@ -510,17 +477,14 @@ start_wizard() {
         7) a="centos"; b="7" ;;
         8) a="centos"; b="9-Stream" ;;
         9) a="rockylinux"; b="9" ;;
-        10) a="alpine"; b="3.19" ;;
-        11) a="alpine"; b="3.18" ;;
-        12) a="archlinux"; b="current" ;;
-        13) a="kali"; b="current" ;;
-        14) a="fedora"; b="39" ;;
-        15) a="oracle"; b="9" ;;
-        16) a="win11"; b=""; is_vm=true ;;
-        17) a="win10"; b=""; is_vm=true ;;
-        18) a="win2022"; b=""; is_vm=true ;;
-        19) 
-            read -p "输入镜像名(如 images:alpine/edge): " custom_sys
+        10) a="archlinux"; b="current" ;;
+        11) a="kali"; b="current" ;;
+        12) a="fedora"; b="39" ;;
+        13) a="win11"; b=""; is_vm=true ;;
+        14) a="win10"; b=""; is_vm=true ;;
+        15) a="win2022"; b=""; is_vm=true ;;
+        16) 
+            read -p "输入镜像名(如 images:ubuntu/24.04): " custom_sys
             a="custom"; b="$custom_sys"
             read -p "是VM吗?(y/n): " v; [[ "$v" == "y" ]] && is_vm=true 
             ;;
@@ -552,9 +516,9 @@ main_menu() {
     while true; do
         clear
         echo "=================================================="
-        echo -e "      ${GREEN}LXD 终极管理面板 (Auto Mirror)${PLAIN}"
+        echo -e "      ${GREEN}LXD 终极管理面板 (Stable V2025)${PLAIN}"
         echo "=================================================="
-        echo -e " 1. ${SKYBLUE}创建实例${PLAIN} (30+系统/批量)"
+        echo -e " 1. ${SKYBLUE}创建实例${PLAIN} (批量/单体)"
         echo -e " 2. ${SKYBLUE}查看列表${PLAIN}"
         echo -e " 3. ${GREEN}单机管理${PLAIN} (开关/重装/重置)"
         echo -e " 4. ${GREEN}修改配置${PLAIN} (CPU/内存/网速)"
