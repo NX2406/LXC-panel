@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# LXD 实例管理脚本 - 稳定版 (移除Alpine)
-# 2025.11.15 Stable
+# LXD 实例管理脚本 - 智能 Swap 增强版
+# 2025.11.16 Smart Swap
 
 # --- 0. 启动反馈 ---
 echo "正在初始化脚本资源..."
@@ -44,7 +44,6 @@ check_lxd_env() {
         echo -e "${YELLOW}LXD 未初始化，执行自动初始化...${PLAIN}"
         lxd init --auto
     fi
-    # 自动添加清华源 (加速 Debian/Ubuntu)
     if ! lxc remote list | grep -q "tuna-images"; then
         lxc remote add tuna-images https://mirrors.tuna.tsinghua.edu.cn/lxc-images/ --protocol=simplestreams --public --accept-certificate >/dev/null 2>&1
     fi
@@ -91,7 +90,6 @@ process_image() {
     image_download_url=""; fixed_system=false; final_alias=""
     echo -e "${SKYBLUE}正在搜索镜像 [Distro: $a, Version: $b]...${PLAIN}"
     
-    # 1. 自定义
     if [[ "$sys_bit" == "x86_64" || "$sys_bit" == "arm64" ]]; then
         local list_url="${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd_images/main/${sys_bit}_all_images.txt"
         self_fixed_images=($(curl -slk -m 5 "$list_url"))
@@ -104,7 +102,6 @@ process_image() {
         done
     fi
     
-    # 2. 官方源
     if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then
         local type_flag="container"; [ "$is_vm" == true ] && type_flag="virtual-machine"
         system=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" '.[] | select(.type == $TYPE and .architecture == $ARCH) | .aliases[0].name' | head -n 1)
@@ -114,7 +111,6 @@ process_image() {
         fi
     fi
 
-    # 3. 清华源
     if [ -z "$image_download_url" ] && [ -z "$final_alias" ]; then
         echo -e "${YELLOW}切换至清华源 (TUNA)...${PLAIN}"
         local type_flag="container"; [ "$is_vm" == true ] && type_flag="virtual-machine"
@@ -123,7 +119,6 @@ process_image() {
             final_alias="tuna-images:${system}"
             echo -e "${GREEN}清华源匹配成功: ${final_alias}${PLAIN}"
         else
-            # 模糊搜索
             system=$(lxc image list tuna-images:${a} --format=json | jq -r --arg ARCH "$sys_bit" --arg TYPE "$type_flag" --arg VER "$b" '.[] | select(.type == $TYPE and .architecture == $ARCH and (.aliases[0].name | contains($VER))) | .aliases[0].name' | head -n 1)
             if [ -n "$system" ]; then
                 final_alias="tuna-images:${system}"
@@ -338,7 +333,7 @@ manage_single_instance() {
                     name="$target_name"; is_rebuild="true"; fixed_system=false
                     check_cdn_file; get_system_arch; process_image
                     
-                    create_container 
+                    create_container # 走 rebuild
                     if [ $? -eq 0 ]; then
                         configure_resources; setup_system
                         old_desc=$(lxc config get "$name" user.description)
@@ -367,15 +362,63 @@ manage_all_menu() {
     read -p "回车返回..." d
 }
 
+# === 核心修改：智能 Swap 计算 ===
 add_host_swap() {
-    clear; echo -e "${GREEN}宿主机 Swap${PLAIN}"
+    clear
+    echo -e "${GREEN}=== 宿主机 Swap 智能管理 ===${PLAIN}"
+    
+    # 1. 获取信息
+    mem_total=$(free -m | awk '/Mem:/ {print $2}')
     current_swap=$(free -m | awk '/Swap/ {print $2}')
-    echo -e "当前: ${SKYBLUE}${current_swap} MB${PLAIN}"
-    read -p "增加 (MB) [1024]: " swap_size; swap_size=${swap_size:-1024}
+    # 获取根目录可用空间
+    disk_avail=$(df -m / | awk 'NR==2 {print $4}')
+    
+    echo -e "物理内存: ${SKYBLUE}${mem_total} MB${PLAIN}"
+    echo -e "当前 Swap: ${SKYBLUE}${current_swap} MB${PLAIN}"
+    echo -e "可用硬盘: ${SKYBLUE}${disk_avail} MB${PLAIN}"
+    
+    # 2. 科学计算推荐值
+    # 基础策略：RAM < 4G 则 2xRAM；RAM > 4G 则 1xRAM 或封顶 4G
+    # 如果是小内存 VPS，Swap 救命很重要
+    rec_swap=$((mem_total * 2))
+    
+    # 如果内存大于 4G，Swap 不需要那么大，给 4G 足够
+    if [ "$mem_total" -gt 4096 ]; then
+        rec_swap=4096
+    fi
+    
+    # 3. 硬盘安全熔断：Swap 不能超过可用磁盘的 40%，防止爆盘
+    max_disk_limit=$((disk_avail * 40 / 100))
+    
+    if [ "$rec_swap" -gt "$max_disk_limit" ]; then
+        rec_swap=$max_disk_limit
+        echo -e "${YELLOW}提示: 硬盘空间有限，已自动下调推荐值至安全范围。${PLAIN}"
+    fi
+    
+    # 4. 交互
+    echo -e "${DIVIDER}"
+    echo -e "系统推荐增加: ${GREEN}${rec_swap} MB${PLAIN}"
+    read -p "请输入增加大小 (MB) [回车默认推荐值]: " swap_size
+    swap_size=${swap_size:-$rec_swap}
+    
+    if [ "$swap_size" -le 0 ]; then
+        echo "跳过。"
+        return
+    fi
+
+    # 5. 执行创建
+    echo -e "${YELLOW}正在创建 Swap 文件 (大小: ${swap_size}MB)...${PLAIN}"
     dd if=/dev/zero of=/swapfile bs=1M count=$swap_size
-    chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile
-    if ! grep -q "/swapfile" /etc/fstab; then echo "/swapfile none swap sw 0 0" >> /etc/fstab; fi
-    echo -e "${GREEN}Swap 创建成功!${PLAIN}"; read -p "回车返回..." d
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+    if ! grep -q "/swapfile" /etc/fstab; then 
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+    
+    echo -e "${GREEN}Swap 创建成功!${PLAIN}"
+    free -m
+    read -p "回车返回..." d
 }
 
 enable_bbr() {
@@ -444,7 +487,7 @@ reconfigure_container() {
 
 start_wizard() {
     clear
-    echo -e "${GREEN}创建向导 (Alpine 已移除)${PLAIN}"
+    echo -e "${GREEN}创建向导${PLAIN}"
     read -p "1. 基础名称 (如 test): " basename; basename=${basename:-test}
     read -p "2. 创建数量 (如 1): " count; count=${count:-1}
     read -p "3. CPU核数 (支持小数,如 0.5): " cpu; cpu=${cpu:-1}
@@ -516,7 +559,7 @@ main_menu() {
     while true; do
         clear
         echo "=================================================="
-        echo -e "      ${GREEN}LXD 终极管理面板 (Stable V2025)${PLAIN}"
+        echo -e "      ${GREEN}LXD 终极管理面板 (Smart Swap)${PLAIN}"
         echo "=================================================="
         echo -e " 1. ${SKYBLUE}创建实例${PLAIN} (批量/单体)"
         echo -e " 2. ${SKYBLUE}查看列表${PLAIN}"
@@ -524,7 +567,7 @@ main_menu() {
         echo -e " 4. ${GREEN}修改配置${PLAIN} (CPU/内存/网速)"
         echo "--------------------------------------------------"
         echo -e " 5. ${YELLOW}批量开关${PLAIN} (全部启动/停止)"
-        echo -e " 6. ${YELLOW}宿主Swap${PLAIN}"
+        echo -e " 6. ${YELLOW}宿主Swap${PLAIN} (智能计算)"
         echo -e " 7. 开启 BBR 加速"
         echo "--------------------------------------------------"
         echo -e " 0. 退出"
