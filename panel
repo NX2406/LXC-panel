@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# LXD 实例管理脚本 - 终极完美版
-# 2025.11.12 Fixed & Enhanced
+# LXD 实例管理脚本 - 修复重装Bug版
+# 2025.11.12 Fix Rebuild Error
 
-# --- 0. 启动立即响应 (解决图1问题) ---
+# --- 0. 启动立即响应 ---
 echo "正在加载脚本资源，请稍候..."
 
 # --- 颜色配置 ---
@@ -20,7 +20,6 @@ check_root() {
 }
 
 install_host_dependencies() {
-    # 静默检查并安装宿主机依赖
     if ! command -v jq >/dev/null 2>&1 || ! command -v bc >/dev/null 2>&1; then
         echo -e "${SKYBLUE}正在安装宿主机依赖 (jq, bc, dos2unix)...${PLAIN}"
         if command -v apt-get >/dev/null 2>&1; then
@@ -83,10 +82,12 @@ get_system_arch() {
     esac
 }
 
-# --- 3. 核心逻辑 ---
+# --- 3. 核心创建逻辑 (修复 Alias 问题) ---
 
 process_image() {
-    image_download_url=""; fixed_system=false
+    image_download_url=""; fixed_system=false; final_alias=""
+    echo -e "${SKYBLUE}正在解析镜像信息...${PLAIN}"
+    
     if [[ "$sys_bit" == "x86_64" || "$sys_bit" == "arm64" ]]; then
         self_fixed_images=($(curl -slk -m 6 ${cdn_success_url}https://raw.githubusercontent.com/oneclickvirt/lxd_images/main/${sys_bit}_all_images.txt))
         for image_name in "${self_fixed_images[@]}"; do
@@ -94,29 +95,47 @@ process_image() {
              else if [[ "$image_name" == "${a}"* ]]; then use_fixed_image "$image_name"; break; fi; fi
         done
     fi
+    
     if [ -z "$image_download_url" ]; then
         local type_flag="container"; [ "$is_vm" == true ] && type_flag="virtual-machine"
         system=$(lxc image list images:${a}/${b} --format=json | jq -r --arg ARCHITECTURE "$sys_bit" --arg TYPE "$type_flag" '.[] | select(.type == $TYPE and .architecture == $ARCHITECTURE) | .aliases[0].name' | head -n 1)
-        if [ -n "$system" ]; then echo -e "${GREEN}使用官方镜像: ${system}${PLAIN}"; fixed_system=false; fi
+        if [ -n "$system" ]; then 
+            echo -e "${GREEN}使用官方镜像: ${system}${PLAIN}"
+            fixed_system=false
+            final_alias="images:${system}" # 官方镜像直接使用
+        fi
     fi
+    
     if [ -z "$image_download_url" ] && [ -z "$system" ]; then echo -e "${RED}错误：未找到镜像${PLAIN}"; exit 1; fi
 }
 
 use_fixed_image() {
-    local image_name=$1; fixed_system=true
-    image_download_url="https://github.com/oneclickvirt/lxd_images/releases/download/${a}/${image_name}"
-    if [[ $(lxc image alias list) != *"$image_name"* ]]; then
-        echo -e "${SKYBLUE}下载镜像中...${PLAIN}"
+    local full_name=$1; fixed_system=true
+    image_download_url="https://github.com/oneclickvirt/lxd_images/releases/download/${a}/${full_name}"
+    
+    # === 关键修复：去除 .zip 后缀作为别名 ===
+    # 例如: ubuntu_22.04.zip -> ubuntu_22.04
+    local alias_name="${full_name%.*}"
+    final_alias="$alias_name"
+
+    # 检查本地是否已存在该别名
+    if [[ $(lxc image alias list) != *"$alias_name"* ]]; then
+        echo -e "${SKYBLUE}下载自定义镜像...${PLAIN}"
         wget -O "lxd_image.zip" "${cdn_success_url}${image_download_url}" || { echo -e "${RED}下载失败${PLAIN}"; exit 1; }
         unzip -o "lxd_image.zip"; rm -f "lxd_image.zip"
-        lxc image import lxd.tar.xz rootfs.squashfs --alias "$image_name"; rm -rf lxd.tar.xz rootfs.squashfs
+        
+        # 导入时使用纯净的别名
+        lxc image import lxd.tar.xz rootfs.squashfs --alias "$alias_name"
+        rm -rf lxd.tar.xz rootfs.squashfs
+    else
+        echo -e "${GREEN}镜像已缓存 (Alias: $alias_name)${PLAIN}"
     fi
 }
 
 create_container() {
     echo -e "${SKYBLUE}正在配置实例: $name ...${PLAIN}"
     
-    # 修复：小数CPU逻辑
+    # 小数 CPU 计算
     if [[ "$cpu" == *.* ]]; then
         cpu_count=$(echo "$cpu" | awk '{print int($1+0.99)}')
         cpu_allowance=$(echo "$cpu * 100 / $cpu_count" | bc)
@@ -125,22 +144,29 @@ create_container() {
         cpu_config="-c limits.cpu=$cpu"
     fi
 
-    # 判断是否为重装模式
+    # === 重装逻辑 (Rebuild) ===
     if [ "$is_rebuild" == "true" ]; then
+        echo -e "${YELLOW}正在停止容器并重置系统...${PLAIN}"
         lxc stop "$name" --force >/dev/null 2>&1
-        # 重装保留配置，只替换镜像
-        if [ -n "$image_download_url" ]; then 
-            lxc rebuild "$name" "$image_name"
-        else 
-            lxc rebuild "$name" images:${system}
+        
+        # 使用处理好的 final_alias 进行重装
+        echo -e "使用镜像: ${GREEN}$final_alias${PLAIN}"
+        lxc rebuild "$name" "$final_alias"
+        
+        if [ $? -ne 0 ]; then
+             echo -e "${RED}重装失败! 请尝试删除实例后重新创建。${PLAIN}"
+             return 1
         fi
+        
+        # 重装后重新启动
+        lxc start "$name"
     else
-        # 新建模式
+        # === 新建逻辑 ===
         if lxc info "$name" >/dev/null 2>&1; then lxc delete "$name" --force; fi
         local args="$cpu_config -c limits.memory=${memory}MiB -s default"
         [ "$is_vm" == true ] && args="--vm $args"
         
-        if [ -n "$image_download_url" ]; then lxc init "$image_name" "$name" $args; else lxc init images:${system} "$name" $args; fi
+        lxc init "$final_alias" "$name" $args
     fi
     
     if [ $? -ne 0 ]; then echo -e "${RED}操作失败!${PLAIN}"; return 1; fi
@@ -157,7 +183,6 @@ configure_storage() {
 }
 
 configure_resources() {
-    # 刷新资源限制
     lxc config device set "$name" root limits.read 500MB
     lxc config device set "$name" root limits.write 500MB
     lxc config device set "$name" root limits.read 5000iops
@@ -168,9 +193,12 @@ configure_resources() {
 
 setup_system() {
     echo -e "${SKYBLUE}启动系统...${PLAIN}"; ori=$(date | md5sum); passwd=${ori:2:9}
-    lxc start "$name"
-    # 修复：增加缓冲时间，防止批量创建时 LXD 响应不及
-    sleep 4
+    # 确保运行状态
+    if ! lxc info "$name" | grep -q "Status: Running"; then
+        lxc start "$name"
+        sleep 4
+    fi
+    
     if [ "$is_vm" == true ]; then return; fi
     if [ "$fixed_system" = false ]; then setup_mirrors; install_packages; fi
     setup_ssh; configure_ipv6
@@ -188,8 +216,7 @@ setup_mirrors() {
 }
 
 install_packages() {
-    # 修复：确保 dos2unix 安装，解决图2报错
-    echo "安装必要软件..."
+    echo "安装基础组件..."
     if echo "$system" | grep -qiE "fedora|rocky|almalinux|oracle|centos"; then 
         lxc exec "$name" -- dnf install -y curl dos2unix >/dev/null 2>&1 || lxc exec "$name" -- yum install -y curl dos2unix >/dev/null 2>&1
     elif echo "$system" | grep -qiE "archlinux"; then 
@@ -225,7 +252,6 @@ configure_port() {
     if [ -z "$container_ip" ]; then echo -e "${RED}无IP，跳过端口映射${PLAIN}"; return; fi
     ipv4_address=$(ip addr show | awk '/inet .*global/ && !/inet6/ {print $2}' | sed -n '1p' | cut -d/ -f1)
     
-    # 修复：解决 Device already exists 报错
     lxc config device override "$name" eth0 ipv4.address="$container_ip" 2>/dev/null || lxc config device set "$name" eth0 ipv4.address "$container_ip" 2>/dev/null
     
     if ! lxc config device show "$name" | grep -q "ssh-port"; then
@@ -246,7 +272,6 @@ configure_ipv6() {
 
 configure_network_speed() {
     [ "$is_vm" == true ] && return
-    # 修复：MB 转换
     local limit_mbit=$(( in * 8 ))
     lxc config device set "$name" eth0 limits.egress "${limit_mbit}Mbit"
     lxc config device set "$name" eth0 limits.ingress "${limit_mbit}Mbit"
@@ -278,7 +303,6 @@ run_batch_creation() {
             configure_storage; configure_resources; setup_system; configure_port; configure_network_speed
             lxc config set "$name" user.description "$name $curr_sshn $passwd $curr_nat1 $curr_nat2"
             echo -e "${GREEN}$name 创建成功!${PLAIN}"
-            # 修复：防止 forkstart 报错的缓冲
             sleep 3 
         fi
     done
@@ -287,7 +311,7 @@ run_batch_creation() {
     read -p "按回车返回..." d
 }
 
-# --- 5. 单实例管理 (修复+增强) ---
+# --- 5. 单实例管理 (重装修复版) ---
 
 manage_single_instance() {
     while true; do
@@ -322,13 +346,26 @@ manage_single_instance() {
                     case $ros in 2) system="ubuntu22.04";; 3) system="centos7";; *) system="debian12";; esac
                     
                     name="$target_name"; is_rebuild="true"; fixed_system=false
+                    
+                    # 重新获取配置（如CPU/内存），为了重装不丢失限制
+                    # 这里为了简化，我们仅保留网络配置，CPU/Memory 需要重新设置或沿用上次的
+                    # 获取当前CPU限制
+                    cur_cpu=$(lxc config get "$name" limits.cpu)
+                    [ -z "$cur_cpu" ] && cpu="1" || cpu="$cur_cpu"
+                    cur_mem=$(lxc config get "$name" limits.memory)
+                    [ -z "$cur_mem" ] && memory="256" || memory=$(echo $cur_mem | tr -cd '[0-9]')
+
                     a="${system%%[0-9]*}"; b="${system##*[!0-9.]}"
                     check_cdn_file; get_system_arch; process_image
                     
                     create_container # 走 rebuild
                     if [ $? -eq 0 ]; then
                         configure_resources; setup_system
-                        lxc config set "$name" user.description "$name $curr_sshn $passwd $curr_nat1 $curr_nat2"
+                        # 更新描述中的密码
+                        old_desc=$(lxc config get "$name" user.description)
+                        read -r -a d_arr <<< "$old_desc"
+                        # d_arr[0]=name, [1]=ssh, [2]=pass, [3]=nat1, [4]=nat2
+                        lxc config set "$name" user.description "${d_arr[0]} ${d_arr[1]} $passwd ${d_arr[3]} ${d_arr[4]}"
                         echo -e "${GREEN}重装完成! 新密码: $passwd${PLAIN}"
                     fi
                 fi
@@ -338,44 +375,32 @@ manage_single_instance() {
     done
 }
 
-# --- 6. 批量管理 (数字菜单修复) ---
+# --- 6. 其他菜单 ---
 
 manage_all_menu() {
     clear
     echo -e "${GREEN}=== 批量开关管理 ===${PLAIN}"
-    echo "1. 开启所有容器 (Start All)"
-    echo "2. 关闭所有容器 (Stop All)"
+    echo "1. 开启所有容器"
+    echo "2. 关闭所有容器"
     echo "0. 返回"
     read -p "请选择: " ma
     case $ma in
-        1) 
-            echo "正在启动..."
-            lxc list --format csv -c n | xargs -I {} lxc start {}
-            echo "完成。"
-            ;;
-        2) 
-            echo "正在停止..."
-            lxc list --format csv -c n | xargs -I {} lxc stop {}
-            echo "完成。"
-            ;;
+        1) echo "正在启动..."; lxc list --format csv -c n | xargs -I {} lxc start {}; echo "完成。";;
+        2) echo "正在停止..."; lxc list --format csv -c n | xargs -I {} lxc stop {}; echo "完成。";;
         *) return ;;
     esac
     read -p "按回车返回..." d
 }
 
 add_host_swap() {
-    clear
-    echo -e "${GREEN}=== 宿主机 Swap 管理 ===${PLAIN}"
+    clear; echo -e "${GREEN}宿主机 Swap 管理${PLAIN}"
     current_swap=$(free -m | awk '/Swap/ {print $2}')
     echo -e "当前 Swap: ${SKYBLUE}${current_swap} MB${PLAIN}"
     read -p "增加 Swap (MB) [1024]: " swap_size; swap_size=${swap_size:-1024}
     dd if=/dev/zero of=/swapfile bs=1M count=$swap_size
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
+    chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile
     if ! grep -q "/swapfile" /etc/fstab; then echo "/swapfile none swap sw 0 0" >> /etc/fstab; fi
-    echo -e "${GREEN}Swap 创建成功!${PLAIN}"
-    read -p "回车返回..." d
+    echo -e "${GREEN}Swap 创建成功!${PLAIN}"; read -p "回车返回..." d
 }
 
 enable_bbr() {
@@ -419,7 +444,7 @@ reconfigure_container() {
         echo "1. 修改 CPU (支持小数)"
         echo "2. 修改 内存"
         echo "3. 修改 硬盘"
-        echo "4. 修改 网速 (单位 MB/s)"
+        echo "4. 修改 网速 (MB/s)"
         read -p "选择: " opt
         case $opt in
             1) 
@@ -442,14 +467,11 @@ reconfigure_container() {
     done
 }
 
-# --- 7. 主菜单 ---
-
 start_wizard() {
     clear
     echo -e "${GREEN}创建向导${PLAIN}"
     read -p "1. 基础名称 (如 test): " basename; basename=${basename:-test}
     read -p "2. 创建数量 (如 1): " count; count=${count:-1}
-    # 修复：提示支持小数
     read -p "3. CPU核数 (支持小数,如 0.5): " cpu; cpu=${cpu:-1}
     read -p "4. 内存MB [256]: " memory; memory=${memory:-256}
     read -p "5. 硬盘GB [2]: " disk; disk=${disk:-2}
@@ -469,11 +491,11 @@ start_wizard() {
         read -p "每个实例 NAT 结束端口 [30025]: " nat_end; nat_end=${nat_end:-30025}
     else nat_end=0; fi
     
-    # 修复：单位改成 MB
     read -p "限速 MB/s [10]: " in_mb; in_mb=${in_mb:-10}
-    in=$in_mb # 传递给内部变量，后面会 *8
+    in=$in_mb
     
     check_cdn_file
+    is_rebuild="false"
     run_batch_creation
 }
 
@@ -481,15 +503,15 @@ main_menu() {
     while true; do
         clear
         echo "=================================================="
-        echo -e "      ${GREEN}LXD 终极管理面板 (Fixed V3)${PLAIN}"
+        echo -e "      ${GREEN}LXD 终极管理面板 (Fixed V4)${PLAIN}"
         echo "=================================================="
-        echo -e " 1. ${SKYBLUE}创建实例${PLAIN} (批量/单体)"
+        echo -e " 1. ${SKYBLUE}创建实例${PLAIN}"
         echo -e " 2. ${SKYBLUE}查看列表${PLAIN}"
         echo -e " 3. ${GREEN}单机管理${PLAIN} (开关/重装) [HOT]"
-        echo -e " 4. ${GREEN}修改配置${PLAIN} (支持小数CPU)"
+        echo -e " 4. ${GREEN}修改配置${PLAIN} (CPU/内存/网速)"
         echo "--------------------------------------------------"
-        echo -e " 5. ${YELLOW}批量开关${PLAIN} (全部启动/停止)"
-        echo -e " 6. ${YELLOW}宿主Swap${PLAIN} (一键增加Swap)"
+        echo -e " 5. ${YELLOW}批量开关${PLAIN} (数字菜单)"
+        echo -e " 6. ${YELLOW}宿主Swap${PLAIN}"
         echo -e " 7. 开启 BBR 加速"
         echo "--------------------------------------------------"
         echo -e " 0. 退出"
